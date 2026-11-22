@@ -3,6 +3,8 @@ import type {
   LoadedSource,
   PermissionMode,
   MessagingPlatformRuntimeInfo,
+  TaskGetResult,
+  TaskRunSnapshotDto,
   WhatsAppUiEvent,
 } from '../../shared/types'
 import type { MessagingBinding } from '../atoms/messaging'
@@ -12,6 +14,7 @@ import type {
   PlatformAccessMode,
   PlatformOwner,
 } from '../components/messaging/access/types'
+import { TASK_SPEC_SAMPLES } from './registry/samples/task-specs'
 
 // ============================================================================
 // Messaging mock state + control handle
@@ -204,6 +207,9 @@ export const playgroundAllowListHandle: PlaygroundAllowListHandle = {
 export const mockElectronAPI = {
   isDebugMode: async () => true,
 
+  // useInlineMention logs every keystroke through this
+  debugLog: (..._args: unknown[]) => {},
+
   // Called at module-load time by SessionFilesSection.tsx (and others) to
   // branch between Electron and web-UI rendering. Must be synchronous.
   getRuntimeEnvironment: (): 'electron' | 'web' => 'electron',
@@ -228,9 +234,72 @@ export const mockElectronAPI = {
     return null
   },
 
-  getTaskOutput: async (taskId: string) => {
-    console.log('[Playground] getTaskOutput called:', taskId)
-    return `Output for task ${taskId}:\n\nThis is a mock output in the playground.\nIn the real app, this would show the actual task output.`
+  // Coding mode worktree picker: a bare-layout repo from a recent folder, a plain clone in the
+  // workspace folder, and two GitHub-only repos. Creating fails for a branch named "taken".
+  listCodingRepos: async (workspaceId: string, recentDirs: string[]) => {
+    console.log('[Playground] listCodingRepos called:', workspaceId, recentDirs)
+    await new Promise(resolve => setTimeout(resolve, 500))
+    return {
+      local: [
+        { kind: 'local' as const, name: 'craft-agents', nameWithOwner: 'craft-ai-agents/craft-agents', gitDir: '/Users/demo/Workspace/CraftAgentsDev/.bare', worktreeParent: '/Users/demo/Workspace/CraftAgentsDev', worktrees: 31, origin: 'recent' as const },
+        { kind: 'local' as const, name: 'blurhash-rs', nameWithOwner: 'demo/blurhash-rs', gitDir: '/Users/demo/Workspace/blurhash-rs/.git', worktreeParent: '/Users/demo/Workspace', worktrees: 1, origin: 'workspace' as const },
+      ],
+      github: [
+        { kind: 'github' as const, nameWithOwner: 'demo/embercourt', description: 'Card game server', isPrivate: true, updatedAt: Date.now() - 86_400_000 },
+        { kind: 'github' as const, nameWithOwner: 'demo/gyul.ai', isPrivate: false, updatedAt: Date.now() - 3 * 86_400_000 },
+      ],
+      cloneRoot: '/Users/demo/Workspace',
+    }
+  },
+
+  createCodingWorktree: async (workspaceId: string, request: { gitDir?: string; cloneNameWithOwner?: string; branch: string }) => {
+    console.log('[Playground] createCodingWorktree called:', workspaceId, request)
+    await new Promise(resolve => setTimeout(resolve, request.cloneNameWithOwner ? 1800 : 900))
+    if (request.branch.endsWith('taken')) throw new Error(`a branch named '${request.branch}' already exists`)
+    const slug = request.branch.split('/').pop()
+    const path = request.gitDir?.endsWith('/.bare')
+      ? `/Users/demo/Workspace/CraftAgentsDev/${slug}`
+      : `/Users/demo/Workspace/${(request.cloneNameWithOwner ?? request.gitDir ?? 'repo').split('/').filter(p => p && p !== '.git').pop()}-${slug}`
+    return { path, branch: request.branch, base: 'origin/main', cloned: !!request.cloneNameWithOwner }
+  },
+
+  getBackgroundTaskOutput: async (sessionId: string, taskId: string) => {
+    console.log('[Playground] getBackgroundTaskOutput called:', sessionId, taskId)
+    if (taskId.startsWith('agent-')) {
+      const done = taskId.includes('done')
+      return {
+        kind: 'agent' as const,
+        message: done
+          ? '**Radix popovers trap focus while open.** Hand focus back after unmount in a `requestAnimationFrame`, and pass `onCloseAutoFocus` when the trigger unmounts with the content.\n\n- `forwardRef` on portal children, or exit animations cannot run.'
+          : 'Starting with the evaluator: `newAutoLabelEntries` is only called from SessionManager, so the merge rules hold.',
+        steps: [
+          { tool: 'Read', label: 'evaluator.ts' },
+          { tool: 'Grep', label: 'newAutoLabelEntries' },
+          { tool: 'Bash', label: 'Run label tests' },
+          { tool: 'mcp__github__search_code', label: 'Search Code' },
+        ],
+        truncated: false,
+      }
+    }
+    if (taskId.includes('fail')) {
+      return { kind: 'text' as const, text: '$ eslint src\nsrc/a.ts\n  12:7  error  Unexpected any  @typescript-eslint/no-explicit-any\n\n✖ 1 problem (1 error, 0 warnings)\n', truncated: false }
+    }
+    return { kind: 'text' as const, text: `bun test v1.3.10\n\nsrc/labels/values.test.ts:\n✓ LabelEntrySet > a plain entry is present [0.02ms]\n✓ LabelEntrySet > values keep everything [0.01ms]\n\n 89 pass\n 0 fail\nRan 89 tests across 9 files. [150.00ms]\n\nWatching for file changes…\n`, truncated: false }
+  },
+
+  stopBackgroundTask: async (sessionId: string, taskId: string) => {
+    console.log('[Playground] stopBackgroundTask called:', sessionId, taskId)
+    return { success: true }
+  },
+
+  // Transport reconnects: SessionFilesSection re-reads the folder on reconnect (returns an unsubscribe)
+  onReconnected: (_callback: () => void) => () => {},
+
+  // Session actions from the chat header (share, regenerate title, show in Finder, …). No `openUrl`
+  // mock: the Browser UI demo copies to the clipboard when it is absent.
+  sessionCommand: async (sessionId: string, command: { type: string }) => {
+    console.log('[Playground] sessionCommand called:', sessionId, command.type)
+    return { success: false, error: 'Not available in the playground' }
   },
 
   // Session files API used by SessionFilesSection (Info popover)
@@ -272,9 +341,24 @@ export const mockElectronAPI = {
     alert(`Would reveal in file manager:\n${path}`)
   },
 
+  getHomeDir: async () => '/Users/you',
+
+  testRemoteConnection: async (_url: string, _token: string) => ({ ok: true }),
+
+  removeWorkspace: async (workspaceId: string) => {
+    console.log('[Playground] removeWorkspace called:', workspaceId)
+    return true
+  },
+
   // NavigationProvider subscribes to deep-link IPC on mount; in the playground
   // there is no main process firing these events, so the listener is a no-op.
   onDeepLinkNavigate: (_callback: unknown) => {
+    void _callback
+    return () => {}
+  },
+
+  // useLabels/useViews subscribe on mount (mobile WebUI demos); labels never change in the playground.
+  onLabelsChanged: (_callback: (workspaceId: string) => void) => {
     void _callback
     return () => {}
   },
@@ -320,7 +404,8 @@ export const mockElectronAPI = {
     const MOCK_MODELS: Record<string, Array<{ id: string; name: string; costInput: number; costOutput: number; contextWindow: number; reasoning: boolean }>> = {
       'openrouter': [
         // Top 10 expensive
-        { id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', costInput: 5, costOutput: 25, contextWindow: 200000, reasoning: true },
+        { id: 'anthropic/claude-opus-4.8', name: 'Claude Opus 4.8', costInput: 5, costOutput: 25, contextWindow: 1000000, reasoning: true },
+        { id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', costInput: 5, costOutput: 25, contextWindow: 1000000, reasoning: true },
         { id: 'xai/grok-4', name: 'Grok 4', costInput: 6, costOutput: 18, contextWindow: 256000, reasoning: true },
         { id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', costInput: 3, costOutput: 15, contextWindow: 200000, reasoning: true },
         { id: 'openai/gpt-5.2-codex', name: 'GPT-5.2 Codex', costInput: 1.75, costOutput: 14, contextWindow: 400000, reasoning: false },
@@ -354,7 +439,7 @@ export const mockElectronAPI = {
       ],
       'deepseek': [
         { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', costInput: 0.56, costOutput: 1.68, contextWindow: 128000, reasoning: true },
-        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', costInput: 0.14, costOutput: 0.42, contextWindow: 128000, reasoning: true },
+        { id: 'deepseek-flash', name: 'DeepSeek V4 Flash', costInput: 0.14, costOutput: 0.42, contextWindow: 128000, reasoning: true },
       ],
       'xai': [
         { id: 'grok-4', name: 'Grok 4', costInput: 6, costOutput: 18, contextWindow: 256000, reasoning: true },
@@ -368,12 +453,16 @@ export const mockElectronAPI = {
         { id: 'meta-llama/Llama-3.3-70B-Instruct', name: 'Llama 3.3 70B', costInput: 0.5, costOutput: 0.7, contextWindow: 131072, reasoning: false },
       ],
       'azure-openai-responses': [
+        { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', costInput: 5, costOutput: 30, contextWindow: 272000, reasoning: true },
+        { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', costInput: 2.5, costOutput: 15, contextWindow: 272000, reasoning: true },
+        { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', costInput: 1, costOutput: 6, contextWindow: 272000, reasoning: true },
         { id: 'gpt-5.2', name: 'GPT-5.2', costInput: 1.75, costOutput: 14, contextWindow: 400000, reasoning: false },
         { id: 'gpt-4o', name: 'GPT-4o', costInput: 2.5, costOutput: 10, contextWindow: 128000, reasoning: false },
         { id: 'gpt-4o-mini', name: 'GPT-4o Mini', costInput: 0.15, costOutput: 0.6, contextWindow: 128000, reasoning: false },
       ],
       'amazon-bedrock': [
-        { id: 'anthropic.claude-opus-4.7', name: 'Claude Opus 4.7', costInput: 5, costOutput: 25, contextWindow: 200000, reasoning: true },
+        { id: 'anthropic.claude-opus-4.8', name: 'Claude Opus 4.8', costInput: 5, costOutput: 25, contextWindow: 1000000, reasoning: true },
+        { id: 'anthropic.claude-opus-4.7', name: 'Claude Opus 4.7', costInput: 5, costOutput: 25, contextWindow: 1000000, reasoning: true },
         { id: 'anthropic.claude-sonnet-4.6', name: 'Claude Sonnet 4.6', costInput: 3, costOutput: 15, contextWindow: 200000, reasoning: true },
         { id: 'anthropic.claude-haiku-4.5', name: 'Claude Haiku 4.5', costInput: 1, costOutput: 5, contextWindow: 200000, reasoning: false },
       ],
@@ -383,7 +472,8 @@ export const mockElectronAPI = {
         { id: 'glm-4.7-flash', name: 'GLM-4.7 Flash', costInput: 0, costOutput: 0, contextWindow: 128000, reasoning: false },
       ],
       'vercel-ai-gateway': [
-        { id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', costInput: 5, costOutput: 25, contextWindow: 200000, reasoning: true },
+        { id: 'anthropic/claude-opus-4.8', name: 'Claude Opus 4.8', costInput: 5, costOutput: 25, contextWindow: 1000000, reasoning: true },
+        { id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7', costInput: 5, costOutput: 25, contextWindow: 1000000, reasoning: true },
         { id: 'anthropic/claude-sonnet-4.6', name: 'Claude Sonnet 4.6', costInput: 3, costOutput: 15, contextWindow: 200000, reasoning: true },
         { id: 'openai/gpt-5.2-codex', name: 'GPT-5.2 Codex', costInput: 1.75, costOutput: 14, contextWindow: 400000, reasoning: false },
       ],
@@ -655,6 +745,24 @@ export const mockElectronAPI = {
       messagingMockState.waEventListeners.delete(callback)
     }
   },
+
+  // Task specs for the task brief demos (registry/samples/task-specs.ts), keyed by slug
+  getTask: async (_workspaceId: string, slug: string): Promise<TaskGetResult> => {
+    const spec = (TASK_SPEC_SAMPLES as Record<string, unknown>)[slug]
+    if (!spec) {
+      return { slug, validation: { valid: false, errors: [{ path: 'root', message: `Task "${slug}" not found`, severity: 'error' }], warnings: [] }, run: null }
+    }
+    return { slug, validation: { valid: true, errors: [], warnings: [] }, spec, run: null }
+  },
+
+  runTask: async (_workspaceId: string, req: { slug: string; orchestratorSessionId?: string }): Promise<TaskRunSnapshotDto> => {
+    console.log('[Playground] runTask', req)
+    await new Promise(resolve => setTimeout(resolve, 800))
+    if (req.slug === 'already-running') {
+      throw new Error(`Task "${req.slug}" already has an active run (run-1) on this orchestrator; stop it before starting another.`)
+    }
+    return { slug: req.slug, runId: 'run-1', taskId: req.slug, status: 'running', orchestratorSessionId: req.orchestratorSessionId, nodes: [], tokensUsed: 0 }
+  },
 }
 
 /**
@@ -828,8 +936,3 @@ export const mockAttachmentCallbacks = {
   },
 }
 
-export const mockBackgroundTaskCallbacks = {
-  onKillTask: (taskId: string) => {
-    console.log('[Playground] Kill task:', taskId)
-  },
-}

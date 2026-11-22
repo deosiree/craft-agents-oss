@@ -70,6 +70,17 @@ export type { ExportResourcesOptions, ExportResult, ResourceImportMode, Resource
 // LLM connection types
 import type { LlmConnection, LlmConnectionWithStatus, LlmAuthType, LlmProviderType, NetworkProxySettings } from '@craft-agent/shared/config';
 export type { LlmConnection, LlmConnectionWithStatus, LlmAuthType, LlmProviderType, NetworkProxySettings };
+import type {
+  DecisionLayerFeature,
+  DecisionLayerSettings,
+  DecisionLayerSettingsPatch,
+  DecisionLayerStatus,
+  DecisionProviderId,
+  DecisionServerProbe,
+  DecisionTestResult,
+  DecisionToggleUsage,
+} from '@craft-agent/shared/decisions';
+export type { DecisionLayerFeature, DecisionLayerSettings, DecisionLayerSettingsPatch, DecisionLayerStatus, DecisionProviderId, DecisionServerProbe, DecisionTestResult, DecisionToggleUsage };
 
 // =============================================================================
 // GUI-only types (not used by server/handler code)
@@ -165,6 +176,8 @@ export interface TransportConnectionState {
   nextRetryInMs?: number
   lastError?: TransportConnectionError
   lastClose?: TransportCloseInfo
+  /** Largest message the connected server accepts (from handshake_ack); absent for older servers */
+  maxMessageBytes?: number
   updatedAt: number
 }
 
@@ -181,6 +194,16 @@ import type {
   Session,
   UnreadSummary,
   CreateSessionOptions,
+  TaskValidationResultDto,
+  TaskCreateRequest,
+  TaskCreateResult,
+  TaskGenerateRequest,
+  TaskGenerateAck,
+  TaskGenerateResult,
+  TaskRunRequest,
+  TaskRunSnapshotDto,
+  TaskGetResult,
+  TaskResultsDto,
   FileAttachment,
   SendMessageOptions,
   SessionEvent,
@@ -211,7 +234,12 @@ import type {
   DirectoryListingResult,
   RemoteSessionTransferPayload,
   ImportRemoteSessionTransferResult,
+  BackgroundTaskOutput,
+  StopBackgroundTaskResult,
 } from '@craft-agent/shared/protocol'
+
+/** Native window material the renderer may paint translucently over (see ThemeContext data-vibrancy). */
+export type WindowVibrancy = 'under-window' | 'mica'
 
 export interface ElectronAPI {
   // Session management
@@ -223,13 +251,32 @@ export interface ElectronAPI {
   deleteSession(sessionId: string): Promise<void>
   sendMessage(sessionId: string, message: string, attachments?: FileAttachment[], storedAttachments?: StoredAttachmentType[], options?: SendMessageOptions): Promise<void>
   cancelProcessing(sessionId: string, silent?: boolean): Promise<void>
-  killShell(sessionId: string, shellId: string): Promise<{ success: boolean; error?: string }>
-  getTaskOutput(taskId: string): Promise<string | null>
+  /** A background task's output so far (shell tail, or an agent's latest message + steps); null when there is none */
+  getBackgroundTaskOutput(sessionId: string, taskId: string, kind?: 'agent' | 'shell' | 'workflow'): Promise<BackgroundTaskOutput | null>
+  /** Stop one background task (shell, agent or workflow); the stopped status arrives as a task_completed event */
+  stopBackgroundTask(sessionId: string, taskId: string): Promise<StopBackgroundTaskResult>
+
+  // Tasks (Conductor)
+  validateTask(workspaceId: string, yaml: string): Promise<TaskValidationResultDto>
+  createTask(workspaceId: string, req: TaskCreateRequest): Promise<TaskCreateResult>
+  generateTask(workspaceId: string, req: TaskGenerateRequest): Promise<TaskGenerateAck>
+  /** Async generate result (or error), keyed by orchestratorSessionId. Subscribe before/after generateTask. */
+  onTaskGenerated(callback: (workspaceId: string, result: TaskGenerateResult) => void): () => void
+  runTask(workspaceId: string, req: TaskRunRequest): Promise<TaskRunSnapshotDto>
+  pauseTask(workspaceId: string, slug: string, runId: string): Promise<void>
+  resumeTask(workspaceId: string, slug: string, runId: string): Promise<void>
+  stopTask(workspaceId: string, slug: string, runId: string): Promise<void>
+  getTask(workspaceId: string, slug: string, runId?: string): Promise<TaskGetResult>
+  listTasks(workspaceId: string): Promise<string[]>
+  getTaskResults(workspaceId: string, slug: string, runId?: string): Promise<TaskResultsDto>
+
   respondToPermission(sessionId: string, requestId: string, allowed: boolean, alwaysAllow: boolean, options?: PermissionResponseOptions): Promise<boolean>
   respondToCredential(sessionId: string, requestId: string, response: CredentialResponse): Promise<boolean>
 
   // Consolidated session command handler
-  sessionCommand(sessionId: string, command: SessionCommand): Promise<void | ShareResult | RefreshTitleResult | { count: number }>
+  sessionCommand(sessionId: string, command: Extract<SessionCommand, { type: 'markPendingPlanExecutionDispatched' }>): Promise<boolean>
+  sessionCommand(sessionId: string, command: Extract<SessionCommand, { type: 'continueInNewSession' }>): Promise<{ sessionId: string }>
+  sessionCommand(sessionId: string, command: Exclude<SessionCommand, { type: 'markPendingPlanExecutionDispatched' | 'continueInNewSession' }>): Promise<void | ShareResult | RefreshTitleResult | { count: number }>
 
   // Server info (REMOTE_ELIGIBLE — returns data from whichever server owns the workspace)
   getServerHomeDir(): Promise<string>
@@ -242,6 +289,10 @@ export interface ElectronAPI {
   // App lifecycle
   relaunchApp(): Promise<void>
   removeWorkspace(workspaceId: string): Promise<boolean>
+  /** Default zoom for app windows in percent (Electron only; Appearance settings). */
+  getDefaultZoomLevel?(): Promise<number>
+  /** Saves and applies the default zoom; resolves to the stored (snapped) level. */
+  setDefaultZoomLevel?(level: number): Promise<number>
   invokeOnServer(url: string, token: string, channel: string, ...args: any[]): Promise<any>
 
   // Remote session transfer (main-process orchestrated, supports chunked upload)
@@ -362,6 +413,9 @@ export interface ElectronAPI {
   // System warnings (startup checks)
   getSystemWarnings(): Promise<{ vcredistMissing: boolean; downloadUrl?: string }>
 
+  /** Native material behind this window (macOS vibrancy, Windows 11 22H2+ Mica); null when the window is opaque. */
+  getWindowVibrancy(): WindowVibrancy | null
+
   // Shell operations
   openUrl(url: string): Promise<void>
   openFile(path: string): Promise<void>
@@ -459,8 +513,10 @@ export interface ElectronAPI {
   getDefaultPermissionsConfig(): Promise<{ config: import('@craft-agent/shared/agent').PermissionsConfigFile | null; path: string }>
   getMcpTools(workspaceId: string, sourceSlug: string): Promise<McpToolsResult>
 
-  // OAuth (server-owned credentials, client-orchestrated flow)
-  performOAuth(args: { sourceSlug: string; sessionId?: string; authRequestId?: string }): Promise<{ success: boolean; error?: string; email?: string }>
+  // OAuth (server-owned credentials, client-orchestrated flow). One flow per workspace + source:
+  // a call while another session's sign-in for the source is live waits for that one instead.
+  // `restart` replaces the live sign-in (its browser window was closed or lost).
+  performOAuth(args: { sourceSlug: string; sessionId?: string; authRequestId?: string; restart?: boolean }): Promise<{ success: boolean; error?: string; email?: string }>
   oauthRevoke(sourceSlug: string): Promise<{ success: boolean }>
 
   // Session content search (full-text search via ripgrep)
@@ -557,8 +613,20 @@ export interface ElectronAPI {
   // RTK token optimization
   getRtkEnabled(): Promise<boolean>
   setRtkEnabled(enabled: boolean): Promise<void>
-  getRtkStatus(opts?: { forceRecheck?: boolean }): Promise<{ installed: boolean; path: string | null; version: string | null }>
+  getRtkStatus(opts?: { forceRecheck?: boolean }): Promise<{ installed: boolean; path: string | null; version: string | null; outdated: boolean; minSafeVersion: string; foundPath: string | null; updateCommand: string }>
   getRtkGain(): Promise<{ totalCommands: number; totalInput: number; totalOutput: number; totalSaved: number; avgSavingsPct: number; totalTimeMs: number; avgTimeMs: number } | null>
+
+  // Decision model (Jev / TypeSafe System One) — opt-in decision layer
+  getDecisionLayerSettings(): Promise<DecisionLayerSettings>
+  setDecisionLayerSettings(patch: DecisionLayerSettingsPatch): Promise<DecisionLayerSettings>
+  getDecisionLayerStatus(): Promise<DecisionLayerStatus>
+  setDecisionApiKey(provider: DecisionProviderId, apiKey: string): Promise<void>
+  deleteDecisionApiKey(provider: DecisionProviderId): Promise<boolean>
+  testDecisionConnection(options?: { settings?: DecisionLayerSettingsPatch; apiKey?: string }): Promise<DecisionTestResult>
+  /** GET {baseUrl}/health of the configured local decision server (Laya / custom). Never rejects for network errors. */
+  probeDecisionServer(options?: { baseUrl?: string }): Promise<DecisionServerProbe>
+  /** Per-feature checks, failures and changes over the last 7 days (from decisions.jsonl). */
+  getDecisionUsage(): Promise<Partial<Record<DecisionLayerFeature, DecisionToggleUsage>>>
 
   // Network proxy settings
   getNetworkProxySettings(): Promise<NetworkProxySettings | undefined>
@@ -573,8 +641,8 @@ export interface ElectronAPI {
   onNotificationNavigate(callback: (data: { workspaceId: string; sessionId: string }) => void): () => void
 
   // Theme preferences sync across windows
-  broadcastThemePreferences(preferences: { mode: string; colorTheme: string; font: string }): Promise<void>
-  onThemePreferencesChange(callback: (preferences: { mode: string; colorTheme: string; font: string }) => void): () => void
+  broadcastThemePreferences(preferences: { mode: string; colorTheme: string; font: string; motion?: string }): Promise<void>
+  onThemePreferencesChange(callback: (preferences: { mode: string; colorTheme: string; font: string; motion?: string }) => void): () => void
 
   // Workspace theme sync across windows
   broadcastWorkspaceThemeChange(workspaceId: string, themeId: string | null): Promise<void>
@@ -582,6 +650,26 @@ export interface ElectronAPI {
 
   // Git operations
   getGitBranch(dirPath: string): Promise<string | null>
+  /** Coding mode worktree picker: local repos (workspace folder + these recent folders) and `gh repo list` */
+  listCodingRepos(workspaceId: string, recentDirs: string[], options?: { refreshGitHub?: boolean }): Promise<import('@craft-agent/shared/protocol').RepoListing>
+  /** Creates a new session's worktree (cloning a GitHub-only repo first); rejects with git's reason */
+  createCodingWorktree(workspaceId: string, request: import('@craft-agent/shared/protocol').CreateWorktreeRequest, recentDirs: string[]): Promise<import('@craft-agent/shared/protocol').CreateWorktreeResult>
+
+  // PR watcher (Coding mode): subscribe per session, then receive pushes; see protocol/pr-watch.ts
+  prWatchSubscribe(sessionId: string): Promise<{ subscriptionId: string | null; state: import('@craft-agent/shared/protocol').PrWatchSessionState }>
+  prWatchUnsubscribe(subscriptionId: string): Promise<void>
+  prWatchRefresh(sessionId: string): Promise<void>
+  /** Card details for one carousel entry (by its stable PR id) */
+  prWatchGetDetails(sessionId: string, prId: string): Promise<import('@craft-agent/shared/protocol').PrDetails | null>
+  /** Pin a PR to the session by URL or number (verifies before persisting) */
+  prWatchBind(sessionId: string, ref: string): Promise<import('@craft-agent/session-tools-core').PrBindToolResult>
+  /** Remove a pinned PR from the session */
+  prWatchUnbind(sessionId: string, ref: string): Promise<import('@craft-agent/session-tools-core').PrUnbindToolResult>
+  /** Enable/disable GitHub auto-merge for one of the session's PRs */
+  prWatchSetAutoMerge(sessionId: string, ref: string, enabled: boolean, method?: import('@craft-agent/shared/protocol').PrMergeMethod): Promise<import('@craft-agent/session-tools-core').PrAutoMergeToolResult>
+  /** Turn auto-fix (the card's Fix toggle) on/off for one of the session's PRs, by its entry id */
+  prWatchSetAutoFix(sessionId: string, prId: string, enabled: boolean): Promise<import('@craft-agent/shared/protocol').PrAutoFixResult>
+  onPrWatchChanged(callback: (sessionId: string, state: import('@craft-agent/shared/protocol').PrWatchSessionState) => void): () => void
 
   // Git Bash (Windows)
   checkGitBash(): Promise<GitBashStatus>
@@ -632,7 +720,54 @@ export interface ElectronAPI {
   setDefaultLlmConnection(slug: string): Promise<{ success: boolean; error?: string }>
   getDefaultThinkingLevel(): Promise<ThinkingLevel>
   setDefaultThinkingLevel(level: ThinkingLevel): Promise<{ success: boolean; error?: string }>
+  /** Claude auto-compact window in tokens; null = the SDK default (the model's full window) */
+  getAutoCompactWindow(): Promise<number | null>
+  setAutoCompactWindow(tokens: number | null): Promise<void>
+  /** Model for Claude subagents whose call names none; null = the session's model */
+  getSubagentModel(): Promise<'haiku' | 'sonnet' | null>
+  setSubagentModel(model: 'haiku' | 'sonnet' | null): Promise<void>
   setWorkspaceDefaultLlmConnection(workspaceId: string, slug: string | null): Promise<{ success: boolean; error?: string }>
+
+  // Projects (workspace-scoped)
+  getProjects(workspaceId: string): Promise<unknown>
+  getProject(workspaceId: string, projectIdOrSlug: string): Promise<unknown | null>
+  createProject(workspaceId: string, input: import('@craft-agent/shared/projects/types').CreateProjectInput): Promise<import('@craft-agent/shared/projects/types').ProjectConfig>
+  updateProject(workspaceId: string, projectSlug: string, patch: Partial<Omit<import('@craft-agent/shared/projects/types').ProjectConfig, 'id' | 'slug' | 'createdAt'>>): Promise<import('@craft-agent/shared/projects/types').ProjectConfig>
+  deleteProject(workspaceId: string, projectSlug: string): Promise<void>
+  listProjectAssets(workspaceId: string, projectSlug: string): Promise<unknown>
+  uploadProjectAsset(workspaceId: string, projectSlug: string, input: { filename: string; base64?: string; text?: string; sourcePath?: string }): Promise<import('@craft-agent/shared/projects/types').ProjectAsset>
+  deleteProjectAsset(workspaceId: string, projectSlug: string, filename: string): Promise<void>
+  onProjectsChanged(callback: (workspaceId: string, projects: unknown) => void): () => void
+
+  // Pages (workspace-scoped mini dashboards)
+  getPages(workspaceId: string): Promise<import('@craft-agent/shared/pages/types').LoadedPage[]>
+  getPage(workspaceId: string, pageIdOrSlug: string): Promise<import('@craft-agent/shared/pages/types').LoadedPage | null>
+  createPage(workspaceId: string, input: import('@craft-agent/shared/pages/types').CreatePageInput): Promise<import('@craft-agent/shared/pages/types').PageConfig>
+  /** Optional fields (projectId, description, refresh) accept explicit null = clear (undefined is dropped by the JSON transport). */
+  updatePage(workspaceId: string, pageSlug: string, patch: Partial<Omit<import('@craft-agent/shared/pages/types').PageConfig, 'id' | 'slug' | 'createdAt' | 'contentDigest' | 'lastRefresh' | 'grants' | 'share' | 'projectId' | 'description' | 'refresh'>> & { projectId?: string | null; description?: string | null; refresh?: import('@craft-agent/shared/pages/types').PageRefreshSpec | null }): Promise<import('@craft-agent/shared/pages/types').PageConfig>
+  deletePage(workspaceId: string, pageSlug: string): Promise<{ publicCopyMayRemain: boolean }>
+  getPageContent(workspaceId: string, pageSlug: string): Promise<{ content: string | null; contentDigest?: string }>
+  setPageContent(workspaceId: string, pageSlug: string, content: string): Promise<import('@craft-agent/shared/pages/types').PageConfig>
+  getPageData(workspaceId: string, pageSlug: string): Promise<import('@craft-agent/shared/pages/types').PageDataSnapshot | null>
+  listPageGrants(workspaceId: string, pageSlug: string): Promise<import('@craft-agent/shared/pages/types').PageActionGrant[]>
+  issuePageGrant(workspaceId: string, pageSlug: string, input: { action: import('@craft-agent/shared/pages/types').PageActionDescriptor; description?: string; ttlMs?: number }): Promise<import('@craft-agent/shared/pages/types').PageActionGrant>
+  revokePageGrant(workspaceId: string, pageSlug: string, grantId: string): Promise<boolean>
+  createPageLease(workspaceId: string, pageSlug: string): Promise<{ lease: import('@craft-agent/shared/pages/types').PageRenderLease; content: string }>
+  releasePageLease(workspaceId: string, leaseId: string): Promise<void>
+  executePageAction(workspaceId: string, request: import('@craft-agent/shared/pages/types').PageActionRequest): Promise<import('@craft-agent/shared/pages/types').PageActionResult>
+  cancelPageAction(workspaceId: string, requestId: string): Promise<boolean>
+  getPageShareCapabilities(): Promise<{ sharingEnabled: boolean }>
+  /** What `includeData` would publish + key paths that look credential-bearing (warn-only). */
+  getPageShareDataScan(workspaceId: string, pageSlug: string): Promise<{ snapshotBytes: number | null; secretCandidates: string[] }>
+  publishPage(workspaceId: string, pageSlug: string, options: { includeData: boolean; password?: string; viewOnlyAcknowledged?: boolean }): Promise<import('@craft-agent/shared/pages/types').PageConfig>
+  setPagePublicationPassword(workspaceId: string, pageSlug: string, password: string | null): Promise<import('@craft-agent/shared/pages/types').PageConfig>
+  unpublishPage(workspaceId: string, pageSlug: string): Promise<{ config: import('@craft-agent/shared/pages/types').PageConfig; warning?: 'remote-copy-may-remain' }>
+  publishPageAsClaudeArtifact(workspaceId: string, pageSlug: string): Promise<import('@craft-agent/shared/pages/types').PageConfig>
+  /** Read a page's cached poster as a data URL — only returns when fresh (digest matches current content). */
+  getPageThumbnail(workspaceId: string, pageSlug: string): Promise<{ dataUrl: string; digest: string } | null>
+  /** Request a (re)capture of a page's poster (no-op on hosts without a capturer). */
+  regeneratePageThumbnail(workspaceId: string, pageSlug: string): Promise<boolean>
+  onPagesChanged(callback: (workspaceId: string, pages: import('@craft-agent/shared/pages/types').LoadedPage[]) => void): () => void
 
   // Automations
   getAutomations(workspaceId: string): Promise<unknown>
@@ -644,7 +779,7 @@ export interface ElectronAPI {
   setAutomationEnabled(workspaceId: string, eventName: string, matcherIndex: number, enabled: boolean): Promise<void>
   duplicateAutomation(workspaceId: string, eventName: string, matcherIndex: number): Promise<void>
   deleteAutomation(workspaceId: string, eventName: string, matcherIndex: number): Promise<void>
-  getAutomationHistory(workspaceId: string, automationId: string, limit?: number): Promise<Array<{ id: string; ts: number; ok: boolean; sessionId?: string; prompt?: string; error?: string; webhook?: { method: string; url: string; statusCode: number; durationMs: number; attempts?: number; error?: string; responseBody?: string } }>>
+  getAutomationHistory(workspaceId: string, automationId: string, limit?: number): Promise<Array<{ id: string; ts: number; ok: boolean; sessionId?: string; prompt?: string; error?: string; skipped?: string; webhook?: { method: string; url: string; statusCode: number; durationMs: number; attempts?: number; error?: string; responseBody?: string }; script?: { script: string; exitCode: number | null; durationMs: number; page?: string; timedOut?: boolean; blocked?: boolean; skipped?: boolean; error?: string } }>>
   getAutomationLastExecuted(workspaceId: string): Promise<Record<string, number>>
   replayAutomation(workspaceId: string, automationId: string, eventName: string): Promise<{ results: Array<{ type: string; url: string; statusCode: number; success: boolean; error?: string; duration: number }> }>
 
@@ -791,6 +926,12 @@ export interface SessionsNavigationState {
   filter: SessionFilter
   details: { type: 'session'; sessionId: string } | null
   rightSidebar?: RightSidebarPanel
+  /**
+   * Presentation mode for the sessions navigator. `'board'` renders the Kanban
+   * board (all sessions, grouped into To Do / In Progress / Done columns) in the
+   * content area instead of the list + chat. Absent/`'list'` is the default.
+   */
+  viewMode?: 'list' | 'board'
 }
 
 /**
@@ -852,6 +993,28 @@ export interface AutomationsNavigationState {
 }
 
 /**
+ * Projects navigation state
+ */
+export interface ProjectsNavigationState {
+  navigator: 'projects'
+  details: { type: 'project'; projectSlug: string } | null
+  rightSidebar?: RightSidebarPanel
+}
+
+/**
+ * Pages navigation state
+ *
+ * Bare `pages` (details: null) shows the full-width library grid — it never
+ * auto-selects a page. Like board mode, the middle navigator collapses to
+ * zero width while a pages route is active.
+ */
+export interface PagesNavigationState {
+  navigator: 'pages'
+  details: { type: 'page'; pageSlug: string } | null
+  rightSidebar?: RightSidebarPanel
+}
+
+/**
  * Unified navigation state
  */
 export type NavigationState =
@@ -860,6 +1023,8 @@ export type NavigationState =
   | SettingsNavigationState
   | SkillsNavigationState
   | AutomationsNavigationState
+  | ProjectsNavigationState
+  | PagesNavigationState
 
 export const isSessionsNavigation = (
   state: NavigationState
@@ -880,6 +1045,14 @@ export const isSkillsNavigation = (
 export const isAutomationsNavigation = (
   state: NavigationState
 ): state is AutomationsNavigationState => state.navigator === 'automations'
+
+export const isProjectsNavigation = (
+  state: NavigationState
+): state is ProjectsNavigationState => state.navigator === 'projects'
+
+export const isPagesNavigation = (
+  state: NavigationState
+): state is PagesNavigationState => state.navigator === 'pages'
 
 export const DEFAULT_NAVIGATION_STATE: NavigationState = {
   navigator: 'sessions',
@@ -905,6 +1078,18 @@ export const getNavigationStateKey = (state: NavigationState): string => {
       return `automations/automation/${state.details.automationId}`
     }
     return 'automations'
+  }
+  if (state.navigator === 'projects') {
+    if (state.details?.type === 'project') {
+      return `projects/project/${state.details.projectSlug}`
+    }
+    return 'projects'
+  }
+  if (state.navigator === 'pages') {
+    if (state.details?.type === 'page') {
+      return `pages/page/${state.details.pageSlug}`
+    }
+    return 'pages'
   }
   if (state.navigator === 'settings') {
     if (state.subpage === null) return 'settings'
@@ -947,11 +1132,31 @@ export const parseNavigationStateKey = (key: string): NavigationState | null => 
   // Handle automations
   if (key === 'automations') return { navigator: 'automations', details: null }
   if (key.startsWith('automations/automation/')) {
-    const automationId = key.slice(22)
+    const automationId = key.slice(23)
     if (automationId) {
       return { navigator: 'automations', details: { type: 'automation', automationId } }
     }
     return { navigator: 'automations', details: null }
+  }
+
+  // Handle projects
+  if (key === 'projects') return { navigator: 'projects', details: null }
+  if (key.startsWith('projects/project/')) {
+    const projectSlug = key.slice(17)
+    if (projectSlug) {
+      return { navigator: 'projects', details: { type: 'project', projectSlug } }
+    }
+    return { navigator: 'projects', details: null }
+  }
+
+  // Handle pages
+  if (key === 'pages') return { navigator: 'pages', details: null }
+  if (key.startsWith('pages/page/')) {
+    const pageSlug = key.slice(11)
+    if (pageSlug) {
+      return { navigator: 'pages', details: { type: 'page', pageSlug } }
+    }
+    return { navigator: 'pages', details: null }
   }
 
   // Handle settings

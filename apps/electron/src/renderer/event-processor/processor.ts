@@ -13,15 +13,18 @@
  */
 
 import type { SessionState, AgentEvent, ProcessResult } from './types'
-import { handleTextDelta, handleTextComplete } from './handlers/text'
+import { handleTextDelta, handleTextComplete, handleTextDiscard, handleMessagesRetracted } from './handlers/text'
 import { handleToolStart, handleToolResult, handleTaskBackgrounded, handleShellBackgrounded, handleTaskProgress, handleTaskCompleted } from './handlers/tool'
 import {
   handleComplete,
   handleError,
   handleTypedError,
   handleSourcesChanged,
+  handleCodingModeChanged,
   handleLabelsChanged,
+  handleProjectIdChanged,
   handleSessionStatusChanged,
+  handleSessionMetadataChanged,
   handleSessionFlagged,
   handleSessionUnflagged,
   handleSessionArchived,
@@ -31,6 +34,7 @@ import {
   handleCredentialRequest,
   handlePlanSubmitted,
   handleStatus,
+  handleRetry,
   handleInfo,
   handleInterrupted,
   handleTitleGenerated,
@@ -64,6 +68,15 @@ export function processEvent(
   event: AgentEvent
 ): ProcessResult {
   switch (event.type) {
+    case 'text_discard':
+      return { state: handleTextDiscard(state, event), effects: [] }
+
+    case 'messages_retracted':
+      return { state: handleMessagesRetracted(state, event), effects: [] }
+
+    case 'retry':
+      return handleRetry(state, event)
+
     case 'text_delta': {
       const newState = handleTextDelta(state, event)
       return { state: newState, effects: [] }
@@ -103,6 +116,12 @@ export function processEvent(
       const newState = handleTaskCompleted(state, event)
       return { state: newState, effects: [] }
     }
+
+    case 'workflow_agent_completed':
+    case 'task_activity':
+      // Live background-task progress (workflow fan-out count, an agent's summary): the chip is
+      // updated in App.tsx's handleBackgroundTaskEvent; nothing to change in message/session state.
+      return { state, effects: [] }
 
     case 'complete':
       return handleComplete(state, event)
@@ -153,11 +172,20 @@ export function processEvent(
     case 'sources_changed':
       return handleSourcesChanged(state, event)
 
+    case 'coding_mode_changed':
+      return handleCodingModeChanged(state, event)
+
     case 'labels_changed':
       return handleLabelsChanged(state, event)
 
+    case 'project_id_changed':
+      return handleProjectIdChanged(state, event)
+
     case 'session_status_changed':
       return handleSessionStatusChanged(state, event)
+
+    case 'session_metadata_changed':
+      return handleSessionMetadataChanged(state, event)
 
     case 'session_flagged':
       return handleSessionFlagged(state, event)

@@ -12,8 +12,11 @@ import type {
   ErrorEvent,
   TypedErrorEvent,
   SourcesChangedEvent,
+  CodingModeChangedEvent,
   LabelsChangedEvent,
+  ProjectIdChangedEvent,
   SessionStatusChangedEvent,
+  SessionMetadataChangedEvent,
   SessionFlaggedEvent,
   SessionUnflaggedEvent,
   SessionArchivedEvent,
@@ -23,6 +26,7 @@ import type {
   CredentialRequestEvent,
   PlanSubmittedEvent,
   StatusEvent,
+  RetryEvent,
   InfoEvent,
   InterruptedEvent,
   TitleGeneratedEvent,
@@ -42,7 +46,7 @@ import type {
   Effect,
 } from '../types'
 import type { Message } from '../../../shared/types'
-import { generateMessageId, appendMessage } from '../helpers'
+import { generateMessageId, appendMessage, clearRetryStatus } from '../helpers'
 
 /**
  * Handle complete - agent loop finished
@@ -54,7 +58,7 @@ export function handleComplete(
   state: SessionState,
   event: CompleteEvent
 ): ProcessResult {
-  const { session } = state
+  const session = clearRetryStatus(state.session)
 
   // Fail-safe: mark any non-terminal tools as complete.
   // Catches 'executing' (normal) and 'backgrounded' (spurious — e.g. foreground Agent
@@ -102,7 +106,12 @@ export function handleComplete(
         isProcessing: false,
         currentStatus: undefined,  // Clear any lingering status
         // Update tokenUsage from complete event (for real-time context counter updates)
-        tokenUsage: event.tokenUsage ?? session.tokenUsage,
+        tokenUsage: event.tokenUsage ? {
+          ...event.tokenUsage,
+          // Cumulative/legacy results may omit occupancy. Omission is not a
+          // context reset and must not erase a newer post-compaction snapshot.
+          contextUsage: event.tokenUsage.contextUsage ?? session.tokenUsage?.contextUsage,
+        } : session.tokenUsage,
         // Update hasUnread flag from main process (state machine for NEW badge)
         // Only update if explicitly provided - undefined means "don't change"
         ...(event.hasUnread !== undefined && { hasUnread: event.hasUnread }),
@@ -120,7 +129,7 @@ export function handleError(
   state: SessionState,
   event: ErrorEvent
 ): ProcessResult {
-  const { session } = state
+  const session = clearRetryStatus(state.session)
 
   // Fail-safe: Mark any running tools as failed
   const messagesWithFailedTools = session.messages.map(m =>
@@ -157,7 +166,7 @@ export function handleTypedError(
   state: SessionState,
   event: TypedErrorEvent
 ): ProcessResult {
-  const { session } = state
+  const session = clearRetryStatus(state.session)
 
   // Fail-safe: Mark any running tools as failed
   const messagesWithFailedTools = session.messages.map(m =>
@@ -196,6 +205,36 @@ export function handleTypedError(
         currentStatus: undefined,  // Clear any lingering status
       },
       streaming: null,
+    },
+    effects: [],
+  }
+}
+
+/**
+ * Retry progress is transient, not transcript history. Only SDK lifecycle
+ * events may end backoff — a delayed token/tool event is not proof of recovery.
+ */
+export function handleRetry(state: SessionState, event: RetryEvent): ProcessResult {
+  const session = clearRetryStatus(state.session)
+  if (event.phase !== 'backoff') {
+    return { state: { session, streaming: state.streaming }, effects: [] }
+  }
+
+  // Replace prior progress rather than accumulating a running row per attempt.
+  const retryMessage: Message = {
+    id: generateMessageId(),
+    role: 'status',
+    statusType: 'retrying',
+    content: event.message,
+    timestamp: Date.now(),
+  }
+  return {
+    state: {
+      session: {
+        ...appendMessage(session, retryMessage),
+        currentStatus: { message: event.message, statusType: 'retrying' },
+      },
+      streaming: state.streaming,
     },
     effects: [],
   }
@@ -544,6 +583,11 @@ export function handleUserMessage(
     // - 'processing' → isQueued = false (queued message is now actually running)
     // - 'accepted'   → isQueued = false (Pi steer path: agent has the message)
     //
+    // A queued message is re-stamped by SessionManager when replay starts so it
+    // sorts after the prior turn's final assistant response. Apply that canonical
+    // timestamp on the processing transition; otherwise the already-mounted
+    // optimistic bubble keeps its queue-time timestamp until the session reloads.
+    //
     // We deliberately do NOT swap `m.id` to the backend's canonical id here.
     // ChatDisplay's `getTurnKey` keys user-message bubbles by id, and a swap
     // would unmount/remount the UserMessageBubble — wiping its local timer
@@ -554,6 +598,7 @@ export function handleUserMessage(
       if (i === existingIndex) {
         return {
           ...m,
+          ...(status === 'processing' ? { timestamp: message.timestamp } : {}),
           isPending: false,
           isQueued: status === 'queued',
         }
@@ -633,6 +678,27 @@ export function handleSourcesChanged(
 }
 
 /**
+ * Handle coding_mode_changed - update the session and let the parent sync its session options
+ */
+export function handleCodingModeChanged(
+  state: SessionState,
+  event: CodingModeChangedEvent
+): ProcessResult {
+  const { session, streaming } = state
+
+  return {
+    state: {
+      session: {
+        ...session,
+        codingMode: event.codingMode || undefined,
+      },
+      streaming,
+    },
+    effects: [{ type: 'coding_mode_changed', sessionId: event.sessionId, codingMode: event.codingMode }],
+  }
+}
+
+/**
  * Handle labels_changed - update session's labels
  */
 export function handleLabelsChanged(
@@ -654,6 +720,27 @@ export function handleLabelsChanged(
 }
 
 /**
+ * Handle project_id_changed - update session's projectId binding
+ */
+export function handleProjectIdChanged(
+  state: SessionState,
+  event: ProjectIdChangedEvent
+): ProcessResult {
+  const { session, streaming } = state
+
+  return {
+    state: {
+      session: {
+        ...session,
+        projectId: event.projectId ?? undefined,
+      },
+      streaming,
+    },
+    effects: [],
+  }
+}
+
+/**
  * Handle session_status_changed - update session's sessionStatus (external metadata change or agent tool)
  */
 export function handleSessionStatusChanged(
@@ -664,6 +751,25 @@ export function handleSessionStatusChanged(
   return {
     state: {
       session: { ...session, sessionStatus: event.sessionStatus },
+      streaming,
+    },
+    effects: [],
+  }
+}
+
+/**
+ * Handle session_metadata_changed - merge programmatic metadata changes (taskNodeCount,
+ * kanbanColumn, and the taskDraft→taskSlug promotion on orchestrator adoption) that don't
+ * propagate via the header-signature file watch.
+ */
+export function handleSessionMetadataChanged(
+  state: SessionState,
+  event: SessionMetadataChangedEvent
+): ProcessResult {
+  const { session, streaming } = state
+  return {
+    state: {
+      session: { ...session, ...event.changes },
       streaming,
     },
     effects: [],
@@ -932,7 +1038,8 @@ export function handleUsageUpdate(
     costUsd: session.tokenUsage?.costUsd ?? 0,
     ...(session.tokenUsage?.cacheReadTokens !== undefined && { cacheReadTokens: session.tokenUsage.cacheReadTokens }),
     ...(session.tokenUsage?.cacheCreationTokens !== undefined && { cacheCreationTokens: session.tokenUsage.cacheCreationTokens }),
-    ...(event.tokenUsage.contextWindow && { contextWindow: event.tokenUsage.contextWindow }),
+    contextWindow: event.tokenUsage.contextWindow ?? session.tokenUsage?.contextWindow,
+    contextUsage: event.tokenUsage.contextUsage ?? session.tokenUsage?.contextUsage,
   }
 
   return {

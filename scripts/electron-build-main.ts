@@ -13,8 +13,6 @@ const OUTPUT_FILE = join(DIST_DIR, "main.cjs");
 const INTERCEPTOR_SOURCE = join(ROOT_DIR, "packages/shared/src/unified-network-interceptor.ts");
 const INTERCEPTOR_OUTPUT = join(DIST_DIR, "interceptor.cjs");
 const SESSION_TOOLS_CORE_DIR = join(ROOT_DIR, "packages/session-tools-core");
-const SESSION_SERVER_DIR = join(ROOT_DIR, "packages/session-mcp-server");
-const SESSION_SERVER_OUTPUT = join(SESSION_SERVER_DIR, "dist/index.js");
 const PI_AGENT_SERVER_DIR = join(ROOT_DIR, "packages/pi-agent-server");
 const PI_AGENT_SERVER_OUTPUT = join(PI_AGENT_SERVER_DIR, "dist/index.js");
 const WA_WORKER_DIR = join(ROOT_DIR, "packages/messaging-whatsapp-worker");
@@ -169,45 +167,6 @@ async function buildInterceptor(): Promise<void> {
   console.log("✅ Interceptor built successfully");
 }
 
-// Build the Session MCP Server (provides session-scoped tools like SubmitPlan for Codex sessions)
-async function buildSessionServer(): Promise<void> {
-  console.log("📋 Building Session MCP Server...");
-
-  // Ensure dist directory exists
-  const distDir = join(SESSION_SERVER_DIR, "dist");
-  if (!existsSync(distDir)) {
-    mkdirSync(distDir, { recursive: true });
-  }
-
-  const proc = spawn({
-    cmd: [
-      "bun", "build",
-      join(SESSION_SERVER_DIR, "src/index.ts"),
-      "--outfile", SESSION_SERVER_OUTPUT,
-      "--target", "node",
-      "--format", "cjs",
-    ],
-    cwd: ROOT_DIR,
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-
-  const exitCode = await proc.exited;
-
-  if (exitCode !== 0) {
-    console.error("❌ Session server build failed with exit code", exitCode);
-    process.exit(exitCode);
-  }
-
-  // Verify output exists
-  if (!existsSync(SESSION_SERVER_OUTPUT)) {
-    console.error("❌ Session server output not found at", SESSION_SERVER_OUTPUT);
-    process.exit(1);
-  }
-
-  console.log("✅ Session server built successfully");
-}
-
 // Build the Pi Agent Server (subprocess for Pi SDK sessions)
 // Optional: skips if package directory is missing (e.g., not synced to OSS).
 async function buildPiAgentServer(): Promise<void> {
@@ -224,7 +183,7 @@ async function buildPiAgentServer(): Promise<void> {
     mkdirSync(distDir, { recursive: true });
   }
 
-  // Use --target=bun --format=esm because the Pi SDK (@mariozechner/pi-coding-agent)
+  // Use --target=bun --format=esm because the Pi SDK (@earendil-works/pi-coding-agent)
   // is ESM-only. --target=node --format=cjs leaves ESM deps as external require()
   // calls that fail at runtime since there are no node_modules relative to dist/.
   const proc = spawn({
@@ -321,10 +280,6 @@ async function main(): Promise<void> {
   // Verify session tools core exists (shared utilities for session-scoped tools)
   verifySessionToolsCore();
 
-  // Build session server (provides session-scoped tools like SubmitPlan)
-  // Depends on session-tools-core being built first
-  await buildSessionServer();
-
   // Build Pi agent server (subprocess for Pi SDK sessions)
   await buildPiAgentServer();
 
@@ -347,6 +302,13 @@ async function main(): Promise<void> {
       "--format=cjs",
       "--outfile=apps/electron/dist/main.cjs",
       "--external:electron",
+      // Claude Agent SDK is pure ESM (sdk.mjs) and calls `createRequire(import.meta.url)`
+      // at module init. esbuild's CJS bundling leaves the synthesized `import_meta.url`
+      // undefined for inner ESM modules, which throws ERR_INVALID_ARG_VALUE on load.
+      // Externalize so Node loads the SDK natively as ESM (with a real import.meta.url).
+      // Electron 39 ships Node 22.x which supports require() of ESM without TLA, so the
+      // bundled main.cjs's `require('@anthropic-ai/claude-agent-sdk')` works.
+      "--external:@anthropic-ai/claude-agent-sdk",
       // Replace grammY's bundled polyfills (node-fetch@2 + abort-controller@3)
       // with native Node globals. esbuild otherwise renames the polyfill's
       // `class AbortSignal` to `_AbortSignal` to dodge collision with the

@@ -11,7 +11,8 @@
 
 import type { PermissionMode } from '../agent/mode-manager.ts';
 import type { ThinkingLevel } from '../agent/thinking-levels.ts';
-import type { StoredAttachment, MessageRole, ToolStatus, AuthRequestType, AuthStatus, CredentialInputMode, StoredMessage } from '@craft-agent/core/types';
+import type { BoundPr, PrMonitorState } from '../protocol/pr-watch.ts';
+import type { StoredAttachment, MessageRole, ToolStatus, AuthRequestType, AuthStatus, CredentialInputMode, StoredMessage, ContextUsageSnapshot } from '@craft-agent/core/types';
 
 /**
  * Session fields that persist to disk.
@@ -36,6 +37,12 @@ export const SESSION_PERSISTENT_FIELDS = [
   'enabledSourceSlugs', 'permissionMode', 'previousPermissionMode', 'workingDirectory',
   // Model/Connection
   'model', 'llmConnection', 'connectionLocked', 'thinkingLevel',
+  // Coding mode (lean coding prompt + tool profile; fixed once the session has messages)
+  'codingMode',
+  // Coding mode: PRs pinned to this session (chat-header PR carousel; see protocol/pr-watch BoundPr)
+  'boundPrs',
+  // Coding mode: per-PR monitor state (auto-fix toggle + what it last acted on), keyed by PR id
+  'prMonitors',
   // Sharing
   'sharedUrl', 'sharedId',
   // Plan execution
@@ -53,6 +60,18 @@ export const SESSION_PERSISTENT_FIELDS = [
   'transferredSessionSummaryApplied',
   // Automation origin
   'triggeredBy',
+  // Project binding (workspace-scoped grouping)
+  'projectId',
+  // Kanban: task/subtask hierarchy + board column
+  'parentSessionId',
+  'kanbanColumn',
+  // Tasks Conductor: link a session back to the task spec / run / DAG node that owns it
+  'taskSlug',
+  'taskRunId',
+  'taskNodeId',
+  'taskNodeCount',
+  'taskDraft',
+  'taskContextFingerprint',
 ] as const;
 
 export type SessionPersistentField = typeof SESSION_PERSISTENT_FIELDS[number];
@@ -85,6 +104,10 @@ export interface SessionTokenUsage {
   cacheCreationTokens?: number;
   /** Model's context window size in tokens (from SDK modelUsage) */
   contextWindow?: number;
+  /** Current occupancy, independent from billable/cumulative token counters. */
+  contextUsage?: ContextUsageSnapshot;
+  /** Backend running totals already counted into costUsd/outputTokens (see AgentEventUsage.runningTotals). */
+  lastRunningTotals?: { costUsd: number; outputTokens: number };
 }
 
 /**
@@ -111,7 +134,7 @@ export interface SessionConfig {
   lastMessageAt?: number;
   /** Whether this session is flagged */
   isFlagged?: boolean;
-  /** Permission mode for this session ('safe', 'ask', 'allow-all') */
+  /** Permission mode for this session ('safe', 'ask', 'guarded', 'allow-all') */
   permissionMode?: PermissionMode;
   /** Previous permission mode (used to preserve modeTransition context across restarts) */
   previousPermissionMode?: PermissionMode;
@@ -145,6 +168,12 @@ export interface SessionConfig {
   connectionLocked?: boolean;
   /** Thinking level for this session ('off', 'think', 'max') */
   thinkingLevel?: ThinkingLevel;
+  /** Coding mode: lean coding system prompt and session-tool profile. Fixed once the session has messages. */
+  codingMode?: boolean;
+  /** Coding mode: PRs pinned to this session, shown in the chat-header PR carousel (pr_bind / pr_unbind). */
+  boundPrs?: BoundPr[];
+  /** Coding mode: per-PR monitor state (auto-fix), keyed by PR id `host/owner/repo#number`. */
+  prMonitors?: Record<string, PrMonitorState>;
   /**
    * Pending plan execution state - tracks "Accept & Compact" flow.
    * When set, indicates a plan needs to be executed after compaction completes.
@@ -196,7 +225,33 @@ export interface SessionConfig {
   /** Whether the transferred-session summary has already been injected. */
   transferredSessionSummaryApplied?: boolean;
   /** Metadata for sessions created by automations */
-  triggeredBy?: { automationName?: string; event?: string; timestamp?: number };
+  triggeredBy?: {
+    automationName?: string;
+    /** Matcher id of the automation that created the session (loop guard: it never re-triggers itself). */
+    automationId?: string;
+    event?: string;
+    timestamp?: number;
+    /** 1 for a session an automation created from a user event; +1 per automation-created hop. */
+    depth?: number;
+  };
+  /** Workspace-scoped project id this session belongs to (undefined = unbound). */
+  projectId?: string;
+  /** Parent session id — when set, this session is a subtask of the parent (undefined = top-level task). */
+  parentSessionId?: string;
+  /** Kanban board column id ('todo' | 'in-progress' | 'done'). Drag-to-move target; independent of sessionStatus. */
+  kanbanColumn?: string;
+  /** Tasks Conductor: slug of the task spec this session belongs to (orchestrator + child nodes). */
+  taskSlug?: string;
+  /** Tasks Conductor: id of the run that spawned this child session (child nodes only). */
+  taskRunId?: string;
+  /** Tasks Conductor: id of the DAG node this child session executes (child nodes only). */
+  taskNodeId?: string;
+  /** Tasks Conductor: total DAG node count (orchestrator only) — board progress denominator that stays stable while children spawn lazily. */
+  taskNodeCount?: number;
+  /** Tasks Conductor: generate-time draft orchestrator. Hidden from the board until adopted (promoted) by createTask. */
+  taskDraft?: boolean;
+  /** Tasks Conductor: fingerprint of the task spec context last sent to this task session's agent (sent again when the spec changes). */
+  taskContextFingerprint?: string;
 }
 
 /**
@@ -227,7 +282,7 @@ export interface SessionHeader {
   lastMessageAt?: number;
   /** Whether this session is flagged */
   isFlagged?: boolean;
-  /** Permission mode for this session ('safe', 'ask', 'allow-all') */
+  /** Permission mode for this session ('safe', 'ask', 'guarded', 'allow-all') */
   permissionMode?: PermissionMode;
   /** Previous permission mode (used to preserve modeTransition context across restarts) */
   previousPermissionMode?: PermissionMode;
@@ -261,6 +316,12 @@ export interface SessionHeader {
   connectionLocked?: boolean;
   /** Thinking level for this session ('off', 'think', 'max') */
   thinkingLevel?: ThinkingLevel;
+  /** Coding mode: lean coding system prompt and session-tool profile. Fixed once the session has messages. */
+  codingMode?: boolean;
+  /** Coding mode: PRs pinned to this session, shown in the chat-header PR carousel (pr_bind / pr_unbind). */
+  boundPrs?: BoundPr[];
+  /** Coding mode: per-PR monitor state (auto-fix), keyed by PR id `host/owner/repo#number`. */
+  prMonitors?: Record<string, PrMonitorState>;
   /**
    * Pending plan execution state - tracks "Accept & Compact" flow.
    * When set, indicates a plan needs to be executed after compaction completes.
@@ -287,7 +348,33 @@ export interface SessionHeader {
   /** Whether the transferred-session summary has already been injected. */
   transferredSessionSummaryApplied?: boolean;
   /** Metadata for sessions created by automations */
-  triggeredBy?: { automationName?: string; event?: string; timestamp?: number };
+  triggeredBy?: {
+    automationName?: string;
+    /** Matcher id of the automation that created the session (loop guard: it never re-triggers itself). */
+    automationId?: string;
+    event?: string;
+    timestamp?: number;
+    /** 1 for a session an automation created from a user event; +1 per automation-created hop. */
+    depth?: number;
+  };
+  /** Workspace-scoped project id this session belongs to (undefined = unbound). */
+  projectId?: string;
+  /** Parent session id — when set, this session is a subtask of the parent (undefined = top-level task). */
+  parentSessionId?: string;
+  /** Kanban board column id ('todo' | 'in-progress' | 'done'). Drag-to-move target; independent of sessionStatus. */
+  kanbanColumn?: string;
+  /** Tasks Conductor: slug of the task spec this session belongs to (orchestrator + child nodes). */
+  taskSlug?: string;
+  /** Tasks Conductor: id of the run that spawned this child session (child nodes only). */
+  taskRunId?: string;
+  /** Tasks Conductor: id of the DAG node this child session executes (child nodes only). */
+  taskNodeId?: string;
+  /** Tasks Conductor: total DAG node count (orchestrator only) — board progress denominator that stays stable while children spawn lazily. */
+  taskNodeCount?: number;
+  /** Tasks Conductor: generate-time draft orchestrator. Hidden from the board until adopted (promoted) by createTask. */
+  taskDraft?: boolean;
+  /** Tasks Conductor: fingerprint of the task spec context last sent to this task session's agent (sent again when the spec changes). */
+  taskContextFingerprint?: string;
   // Pre-computed fields for fast list loading
   /** Number of messages in session */
   messageCount: number;
@@ -322,6 +409,8 @@ export interface SessionMetadata {
   sessionStatus?: SessionStatus;
   /** Labels applied to this session (bare IDs or "id::value" entries) */
   labels?: string[];
+  /** Explicit per-session source selection (absent = follow workspace defaults) */
+  enabledSourceSlugs?: string[];
   /** Permission mode for this session */
   permissionMode?: PermissionMode;
   /** Previous permission mode (used to preserve modeTransition context across restarts) */
@@ -346,6 +435,12 @@ export interface SessionMetadata {
   connectionLocked?: boolean;
   /** Thinking level for this session ('off', 'think', 'max') */
   thinkingLevel?: ThinkingLevel;
+  /** Coding mode: lean coding system prompt and session-tool profile. Fixed once the session has messages. */
+  codingMode?: boolean;
+  /** Coding mode: PRs pinned to this session, shown in the chat-header PR carousel (pr_bind / pr_unbind). */
+  boundPrs?: BoundPr[];
+  /** Coding mode: per-PR monitor state (auto-fix), keyed by PR id `host/owner/repo#number`. */
+  prMonitors?: Record<string, PrMonitorState>;
   /** ID of last message user has read - for unread detection */
   lastReadMessageId?: string;
   /** ID of the last final (non-intermediate) assistant message - for unread detection */
@@ -366,4 +461,22 @@ export interface SessionMetadata {
   archivedAt?: number;
   /** Message ID that this session was branched from (hard context cutoff marker). */
   branchFromMessageId?: string;
+  /** Workspace-scoped project id this session belongs to (undefined = unbound). */
+  projectId?: string;
+  /** Parent session id — when set, this session is a subtask of the parent (undefined = top-level task). */
+  parentSessionId?: string;
+  /** Kanban board column id ('todo' | 'in-progress' | 'done'). Drag-to-move target; independent of sessionStatus. */
+  kanbanColumn?: string;
+  /** Tasks Conductor: slug of the task spec this session belongs to (orchestrator + child nodes). */
+  taskSlug?: string;
+  /** Tasks Conductor: id of the run that spawned this child session (child nodes only). */
+  taskRunId?: string;
+  /** Tasks Conductor: id of the DAG node this child session executes (child nodes only). */
+  taskNodeId?: string;
+  /** Tasks Conductor: total DAG node count (orchestrator only) — board progress denominator that stays stable while children spawn lazily. */
+  taskNodeCount?: number;
+  /** Tasks Conductor: generate-time draft orchestrator. Hidden from the board until adopted (promoted) by createTask. */
+  taskDraft?: boolean;
+  /** Tasks Conductor: fingerprint of the task spec context last sent to this task session's agent (sent again when the spec changes). */
+  taskContextFingerprint?: string;
 }

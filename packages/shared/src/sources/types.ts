@@ -270,6 +270,18 @@ export interface McpSourceConfig {
    */
   clientId?: string;
 
+  /**
+   * Route the OAuth redirect through Craft's hosted relay. Defaults to true.
+   * Set false for servers that only accept loopback redirect URIs.
+   */
+  oauthRelay?: boolean;
+
+  /**
+   * OAuth scopes to request on authorization. Unset sends no `scope` parameter,
+   * leaving the server to grant its default scopes.
+   */
+  scopes?: string[];
+
   // === Stdio transport fields ===
   /**
    * Command to spawn for stdio transport.
@@ -330,6 +342,12 @@ export interface ApiOAuthConfig {
   scopes?: string[];
   /** Auth0-style audience parameter */
   audience?: string;
+  /**
+   * RFC 8707 resource indicator: set for resource-bound servers that require the
+   * issued token to be audience-scoped to a specific resource URI. Sent on the
+   * authorization, token and refresh requests.
+   */
+  resource?: string;
   /** Additional parameters to include in the authorization URL */
   extraParams?: Record<string, string>;
 }
@@ -513,12 +531,6 @@ export interface LoadedSource {
    * Used for credential lookups: source_oauth::{workspaceId}::{sourceSlug}
    */
   workspaceId: string;
-
-  /**
-   * Whether this is a built-in source (e.g., craft-agents-docs).
-   * Built-in sources are always available and not shown in the sources UI.
-   */
-  isBuiltin?: boolean;
 
   /**
    * Pre-computed path to local icon file (icon.svg, icon.png, etc.) if it exists.

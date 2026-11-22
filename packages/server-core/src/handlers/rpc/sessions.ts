@@ -5,6 +5,7 @@ import type { StoredAttachment } from '@craft-agent/core/types'
 import { getWorkspaceByNameOrId } from '@craft-agent/shared/config'
 import { perf } from '@craft-agent/shared/utils'
 import { isValidThinkingLevel, THINKING_LEVEL_IDS } from '@craft-agent/shared/agent/thinking-levels'
+import { isPermissionMode, PERMISSION_MODE_ORDER } from '@craft-agent/shared/agent/modes'
 
 const VALID_THINKING_LEVELS_LIST = THINKING_LEVEL_IDS.map(id => `'${id}'`).join(', ')
 import { pushTyped, type RpcServer } from '@craft-agent/server-core/transport'
@@ -111,7 +112,8 @@ export const HANDLED_CHANNELS = [
   RPC_CHANNELS.sessions.SEND_MESSAGE,
   RPC_CHANNELS.sessions.CANCEL,
   RPC_CHANNELS.sessions.KILL_SHELL,
-  RPC_CHANNELS.tasks.GET_OUTPUT,
+  RPC_CHANNELS.sessions.GET_BACKGROUND_TASK_OUTPUT,
+  RPC_CHANNELS.sessions.STOP_BACKGROUND_TASK,
   RPC_CHANNELS.sessions.RESPOND_TO_PERMISSION,
   RPC_CHANNELS.sessions.RESPOND_TO_CREDENTIAL,
   RPC_CHANNELS.sessions.COMMAND,
@@ -137,7 +139,7 @@ export function registerSessionsHandlers(server: RpcServer, deps: HandlerDeps): 
   // Waits for initialization to complete so sessions are never returned empty during startup
   server.handle(RPC_CHANNELS.sessions.GET, async (ctx) => {
     try {
-      await sessionManager.waitForInit()
+      await sessionManager.waitForSessionsLoaded()
     } catch (error) {
       log.error('GET_SESSIONS continuing after initialization failure:', error)
     }
@@ -165,7 +167,7 @@ export function registerSessionsHandlers(server: RpcServer, deps: HandlerDeps): 
   // Get unread summary across all workspaces
   server.handle(RPC_CHANNELS.sessions.GET_UNREAD_SUMMARY, async () => {
     try {
-      await sessionManager.waitForInit()
+      await sessionManager.waitForSessionsLoaded()
     } catch (error) {
       log.error('GET_UNREAD_SUMMARY continuing after initialization failure:', error)
     }
@@ -187,7 +189,9 @@ export function registerSessionsHandlers(server: RpcServer, deps: HandlerDeps): 
   // Create a new session
   server.handle(RPC_CHANNELS.sessions.CREATE, async (_ctx, workspaceId: string, options?: import('@craft-agent/shared/protocol').CreateSessionOptions) => {
     const end = perf.start('rpc.createSession', { workspaceId })
-    const session = await sessionManager.createSession(workspaceId, options)
+    // The renderer adds the session synchronously from this return value (App.tsx handleCreateSession),
+    // so suppress the broadcast to avoid a redundant hydrate round-trip.
+    const session = await sessionManager.createSession(workspaceId, options, { emitCreatedEvent: false })
     end()
     return session
   })
@@ -261,20 +265,16 @@ export function registerSessionsHandlers(server: RpcServer, deps: HandlerDeps): 
     return sessionManager.cancelProcessing(sessionId, silent)
   })
 
-  // Kill background shell
-  server.handle(RPC_CHANNELS.sessions.KILL_SHELL, async (_ctx, sessionId: string, shellId: string) => {
-    return sessionManager.killShell(sessionId, shellId)
+  // Background tasks: what one has written so far (the task chip's card), and stopping one.
+  // `sessions:killShell` is the older name of the stop channel (shells only).
+  server.handle(RPC_CHANNELS.sessions.GET_BACKGROUND_TASK_OUTPUT, async (_ctx, sessionId: string, taskId: string, kind?: 'agent' | 'shell' | 'workflow') => {
+    return sessionManager.getBackgroundTaskOutput(sessionId, taskId, kind)
   })
-
-  // Get background task output
-  server.handle(RPC_CHANNELS.tasks.GET_OUTPUT, async (_ctx, taskId: string) => {
-    try {
-      const output = await sessionManager.getTaskOutput(taskId)
-      return output
-    } catch (err) {
-      log.error('Failed to get task output:', err)
-      throw err
-    }
+  server.handle(RPC_CHANNELS.sessions.STOP_BACKGROUND_TASK, async (_ctx, sessionId: string, taskId: string) => {
+    return sessionManager.stopBackgroundTask(sessionId, taskId)
+  })
+  server.handle(RPC_CHANNELS.sessions.KILL_SHELL, async (_ctx, sessionId: string, shellId: string) => {
+    return sessionManager.stopBackgroundTask(sessionId, shellId)
   })
 
   // Respond to a permission request (bash command approval)
@@ -320,6 +320,10 @@ export function registerSessionsHandlers(server: RpcServer, deps: HandlerDeps): 
         // Track which session user is actively viewing (for unread state machine)
         return sessionManager.setActiveViewingSession(sessionId, command.workspaceId)
       case 'setPermissionMode':
+        // An unknown mode would fall through to Explore's checks in shouldAllowToolInMode.
+        if (!isPermissionMode(command.mode)) {
+          throw new Error(`Invalid permission mode: ${String(command.mode)}. Valid values: ${PERMISSION_MODE_ORDER.join(', ')}`)
+        }
         return sessionManager.setSessionPermissionMode(sessionId, command.mode)
       case 'setThinkingLevel':
         // Validate thinking level before passing to session manager
@@ -327,12 +331,23 @@ export function registerSessionsHandlers(server: RpcServer, deps: HandlerDeps): 
           throw new Error(`Invalid thinking level: ${command.level}. Valid values: ${VALID_THINKING_LEVELS_LIST}`)
         }
         return sessionManager.setSessionThinkingLevel(sessionId, command.level)
+      case 'setCodingMode':
+        if (typeof command.enabled !== 'boolean') {
+          throw new Error(`Invalid coding mode value: ${String(command.enabled)}. Expected a boolean`)
+        }
+        return sessionManager.setSessionCodingMode(sessionId, command.enabled)
+      case 'continueInNewSession':
+        return sessionManager.continueSessionInNewSession(sessionId, command.codingMode === true)
       case 'updateWorkingDirectory':
         return sessionManager.updateWorkingDirectory(sessionId, command.dir)
       case 'setSources':
         return sessionManager.setSessionSources(sessionId, command.sourceSlugs)
       case 'setLabels':
         return sessionManager.setSessionLabels(sessionId, command.labels)
+      case 'setProjectId':
+        return sessionManager.setSessionProjectId(sessionId, command.projectId)
+      case 'setKanbanColumn':
+        return sessionManager.setKanbanColumn(sessionId, command.column)
       case 'showInFinder': {
         const sessionPath = sessionManager.getSessionPath(sessionId)
         if (sessionPath) {

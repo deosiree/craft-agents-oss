@@ -10,13 +10,16 @@
  * - Handles stream_event for real-time text deltas and tool start detection
  * - Manages pendingText for deferred text_complete (waits for stop_reason from message_delta)
  * - Tracks usage per-message (not cumulative) for accurate context window display
+ * - Takes back the frames of a reply the model's safeguards stopped (refusal fallback)
  */
 
 import type { SDKMessage, SDKAssistantMessageError } from '@anthropic-ai/claude-agent-sdk';
-import type { AgentEvent } from '@craft-agent/core/types';
-import type { AgentError } from '../../errors.ts';
+import type { AgentEvent, ContextUsageSnapshot } from '@craft-agent/core/types';
+import { contextAfterCompaction, contextFromClaude } from '../../context-usage.ts';
+import { createAgentError, type AgentError } from '../../errors.ts';
 import { BaseEventAdapter } from '../base-event-adapter.ts';
-import { ToolIndex, extractToolStarts, extractToolResults, isParentTaskTool, type ContentBlock } from '../../tool-matching.ts';
+import { ToolIndex, extractToolStarts, extractToolResults, isParentTaskTool, type ContentBlock, type ToolResultBlock, type ToolUseBlock } from '../../tool-matching.ts';
+import { classifyClaudeTaskNotification, classifyClaudeTaskProgress } from './task-notification.ts';
 
 /**
  * Callbacks injected by ClaudeAgent for operations that depend on agent state.
@@ -69,24 +72,11 @@ interface AssistantUsage {
   cache_creation_input_tokens: number;
 }
 
-/**
- * Shape of the SDK's `task_notification` system message.
- * The SDK doesn't export a type for this, so we define it locally
- * and validate fields before use to catch silent breakage.
- */
-interface TaskNotificationMessage {
-  type: 'system';
-  subtype: 'task_notification';
-  task_id: string;
-  status?: string;
-  output_file?: string;
-  summary?: string;
-  session_id?: string;
+/** SDK keep-alive progress for a long-running tool: `<tool_use_id>-heartbeat-<n>` under that tool. */
+export function isToolHeartbeat(progress: { tool_use_id: string; parent_tool_use_id: string | null }): boolean {
+  return /-heartbeat-\d+$/.test(progress.tool_use_id)
+    && (!progress.parent_tool_use_id || progress.tool_use_id.startsWith(`${progress.parent_tool_use_id}-heartbeat-`));
 }
-
-/** Valid terminal statuses for background tasks */
-const VALID_TASK_STATUSES = ['completed', 'failed', 'stopped'] as const;
-type TaskStatus = typeof VALID_TASK_STATUSES[number];
 
 export class ClaudeEventAdapter extends BaseEventAdapter {
   // Per-turn state (reset on each startTurn)
@@ -94,10 +84,32 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
   private emittedToolStarts = new Set<string>();
   private activeParentTools = new Set<string>();
   private pendingText: string | null = null;
+  /** Turn of `pendingText` (the API message its text came from). */
+  private pendingTextTurnId: string | undefined;
+  /** The session agent's last API message ended with stop_reason "refusal" (until the next one starts). */
+  private refusalStopped = false;
+  private manualCompactionRequested = false;
+  private manualCompactionBoundarySeen = false;
 
   // Session-persistent state (survives across turns)
+  /**
+   * What each SDK frame put in the transcript, by the frame's uuid: the turn its text went to, the
+   * tool calls it made (assistant frame) or answered (user frame). Read when the CLI takes frames
+   * back (`retract`). Bounded; oldest entries drop first.
+   */
+  private frames = new Map<string, { textTurnId?: string; toolUseIds: string[] }>();
+  /** Tool calls the CLI took back: a result that still arrives for one is dropped. Bounded. */
+  private retractedToolUseIds = new Set<string>();
+  /**
+   * Tool calls made by the session's own agent (top-level, no parent tool use), and the tasks they
+   * started. Background-task completions are attributed through these: a subagent's own background
+   * work is not the session's to report. Bounded; oldest entries drop first.
+   */
+  private topLevelToolUseIds = new Set<string>();
+  private mainAgentTasks = new Map<string, { toolUseId: string; taskType?: string; description?: string; announced?: boolean }>();
   private lastAssistantUsage: AssistantUsage | null = null;
   private cachedContextWindow?: number;
+  private contextUsage?: ContextUsageSnapshot;
   private _sdkTools: string[] = [];
 
   private callbacks: ClaudeAdapterCallbacks;
@@ -116,12 +128,44 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
     this.emittedToolStarts = new Set();
     this.activeParentTools = new Set();
     this.pendingText = null;
+    this.pendingTextTurnId = undefined;
+    this.refusalStopped = false;
     this.lastAssistantUsage = null;
+    this.manualCompactionRequested = false;
+    this.manualCompactionBoundarySeen = false;
   }
 
   // ============================================================
   // Public API
   // ============================================================
+
+  /**
+   * Whether a background task was started by the session's own agent: its starting tool call (from
+   * the notification, or remembered from task_started) was a top-level one. False for a subagent's
+   * own tasks and for anything this adapter never saw start.
+   */
+  wasLaunchedByMainAgent(taskId: string, toolUseId?: string): boolean {
+    if (toolUseId) return this.topLevelToolUseIds.has(toolUseId);
+    return this.mainAgentTasks.has(taskId);
+  }
+
+  /** Called only for our explicit /compact command, after startTurn(). */
+  expectManualCompaction(): void {
+    this.manualCompactionRequested = true;
+  }
+
+  /** True from expectManualCompaction() until the next turn starts. */
+  isManualCompactionRequested(): boolean {
+    return this.manualCompactionRequested;
+  }
+
+  setContextUsage(snapshot: ContextUsageSnapshot): void {
+    this.contextUsage = snapshot;
+  }
+
+  getContextUsage(): ContextUsageSnapshot | undefined {
+    return this.contextUsage;
+  }
 
   /**
    * Convert an SDK message to AgentEvents.
@@ -188,7 +232,7 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
         type: 'text_complete',
         text: this.pendingText,
         isIntermediate: false,
-        turnId: this.currentTurnId || undefined,
+        turnId: this.pendingTextTurnId ?? (this.currentTurnId || undefined),
       };
       this.pendingText = null;
       return event;
@@ -231,6 +275,14 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
   private async adaptAssistant(message: SDKMessage, events: AgentEvent[]): Promise<void> {
     // Check for SDK-level errors FIRST (auth, network, rate limits, etc.)
     if ('error' in message && message.error) {
+      const refusal = refusalError(message);
+      if (refusal) {
+        // It arrives before the stopped reply's message_delta: show that text first
+        const stopped = this.flushPending();
+        if (stopped) events.push(stopped);
+        events.push(refusal);
+        return;
+      }
       const errorEvent = await this.callbacks.mapSDKError(
         message.error as SDKAssistantMessageError,
       );
@@ -243,8 +295,16 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
       return;
     }
 
+    // A fallback model's answer names the stopped reply's frames it replaces
+    this.retract((message as { supersedes?: unknown }).supersedes, events);
+
     // Track usage from non-sidechain assistant messages
     const isSidechain = (message as any).parent_tool_use_id !== null;
+    const structuredContextUsage = !isSidechain ? contextFromClaude((message as any).context_usage) : undefined;
+    if (structuredContextUsage) {
+      this.contextUsage = structuredContextUsage;
+      events.push({ type: 'context_usage', contextUsage: structuredContextUsage });
+    }
     if (!isSidechain && (message as any).message?.usage) {
       const usage = (message as any).message.usage;
       this.lastAssistantUsage = {
@@ -265,6 +325,20 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
           contextWindow: this.cachedContextWindow,
         },
       });
+
+      // Local command replies carry synthetic zero usage, not fresh occupancy.
+      // Never let those overwrite a compact boundary or the previous snapshot.
+      if (!this.manualCompactionRequested && !structuredContextUsage) {
+        const estimate = contextFromClaude({
+          totalTokens: currentInputTokens + (usage.output_tokens ?? 0),
+          rawMaxTokens: this.contextUsage?.limitTokens ?? this.cachedContextWindow,
+          isAutoCompactEnabled: this.contextUsage?.limitKind === 'compaction',
+        });
+        if (estimate) {
+          this.contextUsage = estimate;
+          events.push({ type: 'context_usage', contextUsage: estimate });
+        }
+      }
     }
 
     // Full assistant message with content blocks
@@ -280,6 +354,7 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
 
     // Stateless tool start extraction
     const sdkParentId = (message as any).parent_tool_use_id;
+    if (sdkParentId == null) this.rememberTopLevelToolUses(content as ContentBlock[]);
     const toolStartEvents = extractToolStarts(
       content as ContentBlock[],
       sdkParentId,
@@ -299,9 +374,16 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
 
     events.push(...toolStartEvents);
 
+    const turnId = this.currentTurnId || undefined;
+    this.rememberFrame(message, {
+      textTurnId: textContent ? turnId : undefined,
+      toolUseIds: (content as ContentBlock[]).flatMap(block => block.type === 'tool_use' ? [(block as ToolUseBlock).id] : []),
+    });
+
     if (textContent) {
       // Don't emit text_complete yet — wait for message_delta to get stop_reason
       this.pendingText = textContent;
+      this.pendingTextTurnId = turnId;
     }
   }
 
@@ -315,24 +397,28 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
       );
     }
 
+    const isSessionAgent = !(message as any).parent_tool_use_id;
+
     // Capture turn ID from message_start
     if (event.type === 'message_start') {
       const messageId = event.message?.id;
       if (messageId) {
         this.currentTurnId = messageId;
       }
+      if (isSessionAgent) this.refusalStopped = false;
     }
 
     // message_delta contains the actual stop_reason — emit pending text now
     if (event.type === 'message_delta') {
       const stopReason = event.delta?.stop_reason;
+      if (stopReason === 'refusal' && isSessionAgent) this.refusalStopped = true;
       if (this.pendingText) {
         const isIntermediate = stopReason === 'tool_use';
         events.push({
           type: 'text_complete',
           text: this.pendingText,
           isIntermediate,
-          turnId: this.currentTurnId || undefined,
+          turnId: this.pendingTextTurnId ?? (this.currentTurnId || undefined),
           parentToolUseId: (message as any).parent_tool_use_id || undefined,
         });
         this.pendingText = null;
@@ -393,18 +479,33 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
       const sdkParentId = (message as any).parent_tool_use_id;
       const toolUseResultValue = (message as any).tool_use_result;
 
+      this.rememberFrame(message, {
+        toolUseIds: contentBlocks.flatMap(block => block.type === 'tool_result' ? [(block as ToolResultBlock).tool_use_id] : []),
+      });
       const resultEvents = extractToolResults(
         contentBlocks,
         sdkParentId,
         toolUseResultValue,
         this.toolIndex,
         this.currentTurnId || undefined,
-      );
+      ).filter(event => event.type !== 'tool_result' || !this.retractedToolUseIds.has(event.toolUseId));
 
       // Remove completed Task/Agent tools from activeParentTools
       for (const event of resultEvents) {
         if (event.type === 'tool_result' && isParentTaskTool(event.toolName ?? '')) {
           this.activeParentTools.delete(event.toolUseId);
+        }
+      }
+
+      if (isDetachedToolCallResult(toolUseResultValue)) {
+        // The SDK moved this call (WebFetch/WebSearch) to the background for a message the user
+        // sent mid-turn; its tool_result text is a model-directed placeholder, and the real
+        // result reaches the model later as a queued task notification Craft never sees.
+        for (const event of resultEvents) {
+          if (event.type === 'tool_result') {
+            event.result = DETACHED_TOOL_CALL_RESULT;
+            event.isError = false;
+          }
         }
       }
 
@@ -430,8 +531,11 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
       });
     }
 
-    // Emit tool_start for tools discovered through progress events
-    if (!this.emittedToolStarts.has(progress.tool_use_id)) {
+    // Emit tool_start for tools discovered through progress events. Not for heartbeats: the SDK
+    // sends one every 30 s for a long-running tool (`<tool_use_id>-heartbeat-<n>`, parent = that
+    // tool) with nothing but elapsed time, and a tool_start for each would add a row that never
+    // finishes ("Running …").
+    if (!this.emittedToolStarts.has(progress.tool_use_id) && !isToolHeartbeat(progress)) {
       const progressBlocks: ContentBlock[] = [{
         type: 'tool_use' as const,
         id: progress.tool_use_id,
@@ -499,7 +603,24 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
       cacheCreationTokens: cacheCreation,
       costUsd: msg.total_cost_usd,
       contextWindow: primaryModelUsage?.contextWindow,
+      // `total_cost_usd` and `modelUsage` are running totals for the SDK session (subagents
+      // included), not this turn's spend; `usage` covers the main loop only.
+      runningTotals: {
+        costUsd: msg.total_cost_usd ?? 0,
+        outputTokens: modelUsageEntries.reduce((sum: number, entry: any) => sum + (entry?.outputTokens ?? 0), 0),
+      },
     };
+
+    if (this.manualCompactionRequested) {
+      // The installed CLI returns result(success, is_error:false) even for
+      // too-small/API-failed /compact commands. Only a correlated boundary
+      // proves success, and plan readiness waits until this terminal result.
+      if (this.manualCompactionBoundarySeen && msg.subtype === 'success' && !msg.is_error) {
+        events.push({ type: 'info', message: 'Compacted Conversation', compactionTrigger: 'manual' });
+      } else {
+        events.push({ type: 'compaction_failed' });
+      }
+    }
 
     if (msg.subtype === 'success') {
       events.push({ type: 'complete', usage });
@@ -526,30 +647,151 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
         this.callbacks.onDebug?.(`SDK init: captured ${this._sdkTools.length} tools`);
       }
     } else if (msg.subtype === 'compact_boundary') {
-      events.push({
-        type: 'info',
-        message: 'Compacted Conversation',
-      });
+      this.contextUsage = contextAfterCompaction(msg.compact_metadata?.post_tokens, this.contextUsage);
+      events.push({ type: 'context_usage', contextUsage: this.contextUsage });
+      if (this.manualCompactionRequested && msg.compact_metadata?.trigger === 'manual') {
+        this.manualCompactionBoundarySeen = true;
+      } else {
+        events.push({ type: 'info', message: 'Compacted Conversation', compactionTrigger: 'auto' });
+      }
     } else if (msg.subtype === 'status' && msg.status === 'compacting') {
       events.push({ type: 'status', message: 'Compacting conversation...' });
     } else if (msg.subtype === 'task_notification') {
-      const notification = msg as TaskNotificationMessage;
-      if (!notification.task_id) {
+      const classification = classifyClaudeTaskNotification(message);
+      if (classification.kind === 'missing-task-id') {
         this.callbacks.onDebug?.('[EventAdapter] task_notification missing task_id, skipping');
         return;
       }
-      const status: TaskStatus = VALID_TASK_STATUSES.includes(notification.status as TaskStatus)
-        ? (notification.status as TaskStatus)
-        : 'completed';
-      events.push({
-        type: 'task_completed',
-        taskId: notification.task_id,
-        status,
-        outputFile: notification.output_file,
-        summary: notification.summary,
-        turnId: this.currentTurnId || undefined,
-      });
+      if (classification.kind === 'valid') {
+        const { taskId, toolUseId } = classification.notification;
+        events.push({
+          type: 'task_completed',
+          taskId,
+          status: classification.notification.status,
+          outputFile: classification.notification.outputFile,
+          summary: classification.notification.summary,
+          turnId: this.currentTurnId || undefined,
+          ...(toolUseId ? { toolUseId } : {}),
+          launchedHere: this.wasLaunchedByMainAgent(taskId, toolUseId),
+        });
+      }
+    } else if (msg.subtype === 'task_progress') {
+      // What one of the session's own background tasks is doing (a subagent's nested tasks have no chip)
+      const activity = classifyClaudeTaskProgress(message);
+      if (activity && this.wasLaunchedByMainAgent(activity.taskId, activity.toolUseId)) {
+        events.push({ type: 'task_activity', ...activity, turnId: this.currentTurnId || undefined });
+      }
+    } else if (msg.subtype === 'task_started') {
+      // Remember the session's own tasks (structured, unlike tool-result text) and announce a
+      // background one; a foreground task is announced if it later moves to the background.
+      if (typeof msg.task_id === 'string' && typeof msg.tool_use_id === 'string' && this.topLevelToolUseIds.has(msg.tool_use_id)) {
+        this.mainAgentTasks.set(msg.task_id, {
+          toolUseId: msg.tool_use_id,
+          ...(typeof msg.task_type === 'string' ? { taskType: msg.task_type } : {}),
+          ...(typeof msg.description === 'string' && msg.description ? { description: msg.description } : {}),
+        });
+        trimOldest(this.mainAgentTasks, 500);
+        if (msg.is_backgrounded === true) this.pushBackgroundedTask(msg.task_id, events);
+      }
+    } else if (msg.subtype === 'task_updated') {
+      if (typeof msg.task_id === 'string' && msg.patch?.is_backgrounded === true) this.pushBackgroundedTask(msg.task_id, events);
+    } else if (msg.subtype === 'informational') {
+      // The CLI's notice after a stopped reply ("…'s safeguards stopped the response above ·
+      // continuing once with that noted"); its other notices are not shown
+      const notice = typeof msg.content === 'string' ? msg.content.trim() : '';
+      if (this.refusalStopped && notice) {
+        this.refusalStopped = false;
+        events.push({ type: 'model_refusal', message: notice });
+      }
+    } else if (msg.subtype === 'model_refusal_fallback') {
+      // A stopped reply is answered again on a fallback model (`scope` 'local': only a subagent's
+      // answer, the session's model stays)
+      this.retract(msg.retracted_message_uuids, events);
+      const fallbackModel = msg.scope !== 'local' && typeof msg.fallback_model === 'string' && msg.fallback_model
+        ? msg.fallback_model
+        : undefined;
+      const notice = typeof msg.content === 'string' && msg.content.trim()
+        ? msg.content.trim()
+        : `The model's safeguards stopped its reply. ${msg.fallback_model ?? 'Another model'} answers instead.`;
+      events.push({ type: 'model_refusal', message: notice, ...(fallbackModel ? { fallbackModel } : {}) });
     }
+  }
+
+  /** Remember what a frame put in the transcript, for `retract`. */
+  private rememberFrame(message: SDKMessage, frame: { textTurnId?: string; toolUseIds: string[] }): void {
+    const uuid = (message as { uuid?: unknown }).uuid;
+    if (typeof uuid !== 'string' || (!frame.textTurnId && frame.toolUseIds.length === 0)) return;
+    this.frames.set(uuid, frame);
+    trimOldest(this.frames, 500);
+  }
+
+  /**
+   * The CLI took back frames it sent: a reply the model's safeguards stopped, which a fallback model
+   * answers instead (`supersedes` on the answer's first frame, `retracted_message_uuids` on its
+   * notice; both name the same frames, and a frame is taken back once). Unfinished text is discarded,
+   * finished text and the tool calls are removed, and a result that still comes for one is dropped.
+   */
+  private retract(uuids: unknown, events: AgentEvent[]): void {
+    if (!Array.isArray(uuids)) return;
+    const turnIds = new Set<string>();
+    const toolUseIds = new Set<string>();
+    for (const uuid of uuids) {
+      const frame = typeof uuid === 'string' ? this.frames.get(uuid) : undefined;
+      if (!frame) continue;
+      this.frames.delete(uuid);
+      if (frame.textTurnId) turnIds.add(frame.textTurnId);
+      for (const id of frame.toolUseIds) toolUseIds.add(id);
+    }
+    if (turnIds.size === 0 && toolUseIds.size === 0) return;
+    if (this.pendingText !== null && this.pendingTextTurnId && turnIds.has(this.pendingTextTurnId)) {
+      this.pendingText = null;
+      events.push({ type: 'text_discard', turnId: this.pendingTextTurnId });
+    }
+    for (const id of toolUseIds) {
+      this.retractedToolUseIds.add(id);
+      this.activeParentTools.delete(id);
+    }
+    trimOldest(this.retractedToolUseIds, 500);
+    events.push({ type: 'messages_retracted', turnIds: [...turnIds], toolUseIds: [...toolUseIds] });
+  }
+
+  /** Remember top-level tool calls so later task events can be attributed to the session's agent. */
+  private rememberTopLevelToolUses(content: ContentBlock[]): void {
+    for (const block of content) {
+      if (block.type === 'tool_use' && typeof (block as { id?: unknown }).id === 'string') {
+        this.topLevelToolUseIds.add((block as { id: string }).id);
+      }
+    }
+    trimOldest(this.topLevelToolUseIds, 2000);
+  }
+
+  /**
+   * Announce one of the session's own tasks as backgrounded, once. Agents and workflows are
+   * detected from their tool result (which carries the workflow id); everything else (Bash,
+   * Monitor, MCP tasks...) is announced from here.
+   */
+  private pushBackgroundedTask(taskId: string, events: AgentEvent[]): void {
+    const task = this.mainAgentTasks.get(taskId);
+    if (!task || task.announced) return;
+    task.announced = true;
+    if (task.taskType === 'local_agent' || task.taskType === 'local_workflow') return;
+    const input = this.toolIndex.getInput(task.toolUseId);
+    const intent = task.description
+      ?? (typeof input?._intent === 'string' ? input._intent : undefined)
+      ?? (typeof input?.description === 'string' ? input.description : undefined);
+    const turnId = this.currentTurnId || undefined;
+    if (task.taskType === 'local_bash') {
+      events.push({
+        type: 'shell_backgrounded',
+        toolUseId: task.toolUseId,
+        shellId: taskId,
+        turnId,
+        ...(intent ? { intent } : {}),
+        ...(typeof input?.command === 'string' ? { command: input.command } : {}),
+      });
+      return;
+    }
+    events.push({ type: 'task_backgrounded', toolUseId: task.toolUseId, taskId, turnId, kind: 'task', ...(intent ? { intent } : {}) });
   }
 
   private adaptAuthStatus(message: SDKMessage, events: AgentEvent[]): void {
@@ -560,5 +802,50 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
         message: `Auth error: ${msg.error}. Try running /auth to re-authenticate.`,
       });
     }
+  }
+}
+
+/**
+ * The assistant error frame that ends a turn whose reply the model's safeguards stopped when no
+ * model answers it instead (stop_reason "refusal"; the SDK's `model_refusal_no_fallback` notice just
+ * before it has no text). Its text is Anthropic's explanation ("API Error: Opus 5.5's safeguards
+ * flagged this session (…). …\n\nTry rephrasing …\n\nLearn more: …\n\nRequest ID: …"): the prose
+ * becomes the message, the labelled lines at its end the details. Null for any other error frame.
+ */
+export function refusalError(message: SDKMessage): { type: 'typed_error'; error: AgentError } | null {
+  const frame = (message as { message?: { stop_reason?: unknown; content?: unknown } }).message;
+  if (frame?.stop_reason !== 'refusal') return null;
+  const blocks: unknown[] = Array.isArray(frame.content) ? frame.content : [];
+  const text = blocks
+    .map(block => (block as { type?: unknown }).type === 'text' ? String((block as { text?: unknown }).text ?? '') : '')
+    .join('');
+  const paragraphs = text.trim().replace(/^API Error:\s*/, '').split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+  let prose = paragraphs.length;
+  while (prose > 0 && /^[A-Z][\w ]{0,24}: \S/.test(paragraphs[prose - 1]!) && !paragraphs[prose - 1]!.includes('\n')) prose--;
+  const error = createAgentError('model_refusal');
+  if (prose > 0) error.message = paragraphs.slice(0, prose).join(' ');
+  if (prose < paragraphs.length) error.details = paragraphs.slice(prose);
+  return { type: 'typed_error', error };
+}
+
+/** Shown for a tool call the SDK moved to the background (see `isDetachedToolCallResult`). */
+export const DETACHED_TOOL_CALL_RESULT =
+  'Still running in the background — the result goes straight to the agent when it finishes.';
+
+/**
+ * `tool_use_result` of a call that stepped aside for a mid-turn user message (SDK >=0.3.287,
+ * WebFetch/WebSearch only). Craft's matcher-less PostToolUse hook keeps the CLI from detaching
+ * calls at all (`claude-agent.ts`), so this only guards against that hook ever being narrowed.
+ */
+export function isDetachedToolCallResult(value: unknown): boolean {
+  return typeof value === 'object' && value !== null
+    && (value as { detachedToolCall?: unknown }).detachedToolCall === true;
+}
+
+/** Drop the oldest entries (insertion order) beyond `max`. */
+function trimOldest(collection: Set<string> | Map<string, unknown>, max: number): void {
+  for (const key of collection.keys()) {
+    if (collection.size <= max) return;
+    collection.delete(key);
   }
 }

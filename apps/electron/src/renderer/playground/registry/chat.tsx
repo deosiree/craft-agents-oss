@@ -9,6 +9,14 @@ import { ChatInputZone, InputContainer } from '@/components/app-shell/input'
 import { setRecentWorkingDirs } from '@/components/app-shell/input/working-directory-history'
 import type { StructuredResponse } from '@/components/app-shell/input/structured/types'
 import { EmptyStateHint, getHintCount, getHintTemplate } from '@/components/chat/EmptyStateHint'
+import { NewChatEmptyState } from '@/components/app-shell/chat-display/TranscriptStates'
+import { NewChatSuggestions } from '@/components/app-shell/chat-display/NewChatSuggestions'
+import { pickNewChatSuggestions } from '@/components/app-shell/chat-display/new-chat-suggestions'
+import { TaskBrief } from '@/components/app-shell/chat-display/TaskBrief'
+import { taskBriefFromSpec } from '@/components/app-shell/chat-display/task-brief'
+import { CHAT_LAYOUT } from '@/config/layout'
+import { TASK_SPEC_SAMPLES, TASK_SPEC_SAMPLE_OPTIONS, type TaskSpecSample } from './samples/task-specs'
+import type { LoadedSource } from '@craft-agent/shared/sources/types'
 import { Button } from '@/components/ui/button'
 import { motion } from 'motion/react'
 import { ArrowUp, Paperclip, ChevronDown, Circle, Sparkles } from 'lucide-react'
@@ -78,15 +86,18 @@ kubectl apply -f k8s/deployment.yaml
 kubectl rollout status deployment/myapp`,
 }
 
-// Sample background tasks
+// Sample background tasks: a running agent with its live summary, a running command, a finished
+// agent and a failed command (the playground's getBackgroundTaskOutput mock answers per id prefix).
 const sampleBackgroundTasks: BackgroundTask[] = [
   {
-    id: 'task-abc123',
+    id: 'agent-abc123',
     type: 'agent',
     toolUseId: 'tool-1',
-    startTime: Date.now() - 45000, // 45 seconds ago
-    elapsedSeconds: 45,
-    intent: 'Explore codebase structure',
+    startTime: Date.now() - 169000, // 2m 49s ago
+    elapsedSeconds: 169,
+    intent: 'Adversarial review of label fix',
+    status: 'running',
+    activity: { summary: 'Checking callers of newAutoLabelEntries', lastToolName: 'Grep', toolUses: 23 },
   },
   {
     id: 'shell-xyz456',
@@ -94,6 +105,28 @@ const sampleBackgroundTasks: BackgroundTask[] = [
     toolUseId: 'tool-2',
     startTime: Date.now() - 154000, // 2m 34s ago
     elapsedSeconds: 154,
+    intent: 'bun test --watch',
+    status: 'running',
+  },
+  {
+    id: 'agent-done789',
+    type: 'agent',
+    toolUseId: 'tool-3',
+    startTime: Date.now() - 192000,
+    elapsedSeconds: 190,
+    intent: 'Research Radix popover focus rules',
+    status: 'completed',
+    completedAt: Date.now() - 2000,
+  },
+  {
+    id: 'shell-fail01',
+    type: 'shell',
+    toolUseId: 'tool-4',
+    startTime: Date.now() - 20000,
+    elapsedSeconds: 18,
+    intent: 'bun run lint',
+    status: 'failed',
+    completedAt: Date.now() - 1000,
   },
 ]
 
@@ -105,6 +138,7 @@ const singleBackgroundTask: BackgroundTask[] = [
     startTime: Date.now() - 23000,
     elapsedSeconds: 23,
     intent: 'Search for TypeScript files',
+    status: 'running',
   },
 ]
 
@@ -116,6 +150,7 @@ const longRunningTasks: BackgroundTask[] = [
     startTime: Date.now() - 3723000, // 1h 2m 3s
     elapsedSeconds: 3723,
     intent: 'Refactor authentication system',
+    status: 'running',
   },
   {
     id: 'shell-long-2',
@@ -123,6 +158,8 @@ const longRunningTasks: BackgroundTask[] = [
     toolUseId: 'tool-long-2',
     startTime: Date.now() - 245000, // 4m 5s
     elapsedSeconds: 245,
+    status: 'orphaned',
+    completedAt: Date.now() - 5000,
   },
   {
     id: 'task-long-3',
@@ -131,6 +168,8 @@ const longRunningTasks: BackgroundTask[] = [
     startTime: Date.now() - 12000, // 12s
     elapsedSeconds: 12,
     intent: 'Run tests',
+    status: 'completed',
+    completedAt: Date.now() - 2000,
   },
 ]
 
@@ -196,6 +235,8 @@ const playgroundAppShellContext = {
   onMarkSessionRead: () => {},
   onMarkSessionUnread: () => {},
   onSetActiveViewingSession: () => {},
+  // The # menu's status picker reads these from the shell context
+  sessionStatuses: inputContainerSampleStatuses,
   onSessionStatusChange: () => {},
   onDeleteSession: async () => true,
   onOpenFile: () => {},
@@ -549,6 +590,9 @@ interface InputContainerPlaygroundProps {
   attachmentCount?: number
   showFollowUps?: boolean
   followUpCount?: number
+  showCodingMode?: boolean
+  codingMode?: boolean
+  conversationStarted?: boolean
 }
 
 function InputContainerPlayground({
@@ -574,12 +618,19 @@ function InputContainerPlayground({
   attachmentCount = 2,
   showFollowUps = false,
   followUpCount = 2,
+  showCodingMode = true,
+  codingMode = false,
+  conversationStarted = true,
 }: InputContainerPlaygroundProps) {
   const playgroundSessionId = 'playground-session'
+  const [coding, setCoding] = React.useState(codingMode)
+  React.useEffect(() => {
+    setCoding(codingMode)
+  }, [codingMode])
   const [model, setModel] = React.useState(currentModel)
   const [mode, setMode] = React.useState<PermissionMode>(permissionMode)
   const [inputValue, setInputValue] = React.useState('')
-  const [currentSessionStatus, setCurrentSessionStatus] = React.useState('in-progress')
+  const [currentSessionStatus] = React.useState('in-progress')
   const [cwd, setCwd] = React.useState(workingDirectory)
 
   React.useEffect(() => {
@@ -741,14 +792,12 @@ function InputContainerPlayground({
           onPermissionModeChange={setMode}
           tasks={showTasks ? sampleBackgroundTasks : []}
           sessionId={playgroundSessionId}
-          onKillTask={(taskId) => console.log('[Playground] Kill task:', taskId)}
-          onInsertMessage={setInputValue}
+          onStopTask={(task) => console.log('[Playground] Stop task:', task.id)}
+          onRunCommand={(command) => console.log('[Playground] Run in background:', command)}
           sessionLabels={showLabels ? sessionLabels : []}
           labels={showLabels ? labels : []}
           onLabelsChange={setSessionLabels}
-          sessionStatuses={showStatuses ? inputContainerSampleStatuses : []}
           currentSessionStatus={showStatuses ? currentSessionStatus : undefined}
-          onSessionStatusChange={setCurrentSessionStatus}
           inputProps={{
             placeholder,
             disabled,
@@ -764,6 +813,14 @@ function InputContainerPlayground({
             workingDirectory: showWorkingDirectory ? cwd : undefined,
             onWorkingDirectoryChange: showWorkingDirectory ? setCwd : undefined,
             followUpItems,
+            isEmptySession: !conversationStarted,
+            workspaceId: 'playground-workspace',
+            sessionId: playgroundSessionId,
+            codingMode: coding,
+            onCodingModeChange: showCodingMode ? setCoding : undefined,
+            onContinueWithCodingMode: showCodingMode
+              ? (enabled: boolean) => console.log('[Playground] Continue in a new session, coding mode:', enabled)
+              : undefined,
             onSubmit: mockInputCallbacks.onSubmit,
             onModelChange: setModel,
             onInputChange: setInputValue,
@@ -821,7 +878,7 @@ function ActiveTasksBarContext({ tasks = sampleBackgroundTasks }: ActiveTasksBar
           onPermissionModeChange={setPermissionMode}
           tasks={tasks}
           sessionId="playground-session"
-          onKillTask={(taskId) => console.log('[Playground] Kill task:', taskId)}
+          onStopTask={(task) => console.log('[Playground] Stop task:', task.id)}
         />
 
         {/* Real InputContainer */}
@@ -954,6 +1011,52 @@ function PermissionInputToggle({ autoToggle = false, autoToggleInterval = 3000, 
   )
 }
 
+const previewSource = (slug: string, name: string, provider: string, api?: Record<string, unknown>): LoadedSource =>
+  ({ config: { slug, name, provider, type: 'api', enabled: true, connectionStatus: 'connected', api } }) as unknown as LoadedSource
+
+const NEW_CHAT_PREVIEW_SOURCES: Record<string, LoadedSource[]> = {
+  connected: [
+    previewSource('gmail', 'Gmail', 'google', { googleService: 'gmail' }),
+    previewSource('google-calendar', 'Google Calendar', 'google', { googleService: 'calendar' }),
+    previewSource('slack', 'Slack', 'slack'),
+    previewSource('todoist', 'Todoist', 'todoist'),
+  ],
+  none: [],
+  oneGeneric: [previewSource('cat-facts', 'Cat Facts', 'catfact')],
+}
+
+/** The new-chat empty state with its suggestion chips, for a given set of workspace sources */
+function NewChatEmptyStatePreview({ sources = 'connected', compact = false }: { sources?: string; compact?: boolean }) {
+  const suggestions = pickNewChatSuggestions(NEW_CHAT_PREVIEW_SOURCES[sources] ?? [])
+  return (
+    <div className="relative h-[420px] w-full">
+      <NewChatEmptyState compact={compact}>
+        <NewChatSuggestions suggestions={suggestions} onSelect={(s) => console.log('[playground] run suggestion', s)} />
+      </NewChatEmptyState>
+    </div>
+  )
+}
+
+/** The task brief an unrun task session shows in its transcript column, for a task.yaml sample */
+function TaskBriefPreview({ sample = 'gitignore-the-workspace', starting = false, compact = false }: { sample?: TaskSpecSample; starting?: boolean; compact?: boolean }) {
+  const brief = taskBriefFromSpec(TASK_SPEC_SAMPLES[sample])
+  return (
+    <div className={cn('mx-auto w-full', compact ? 'max-w-[390px]' : CHAT_LAYOUT.maxWidth, compact ? CHAT_LAYOUT.compactContainerPadding : CHAT_LAYOUT.containerPadding)}>
+      {brief && (
+        <TaskBrief
+          brief={brief}
+          compact={compact}
+          starting={starting}
+          onRun={() => console.log('[playground] run task', sample)}
+          onEdit={() => console.log('[playground] edit task', sample)}
+          onOpenUrl={(url) => console.log('[playground] open url', url)}
+          onOpenFile={(path) => console.log('[playground] open file', path)}
+        />
+      )}
+    </div>
+  )
+}
+
 // Generate variants for all hints dynamically
 const emptyStateHintVariants = Array.from({ length: getHintCount() }, (_, i) => ({
   name: `Hint ${i + 1}`,
@@ -962,6 +1065,49 @@ const emptyStateHintVariants = Array.from({ length: getHintCount() }, (_, i) => 
 }))
 
 export const chatComponents: ComponentEntry[] = [
+  {
+    id: 'new-chat-empty-state',
+    name: 'NewChatEmptyState',
+    category: 'Chat',
+    description: 'Empty new chat: serif question, capability line and up to three suggestion chips from the workspace sources (a click sends the prompt)',
+    component: NewChatEmptyStatePreview,
+    props: [
+      {
+        name: 'sources',
+        description: 'Workspace sources the chips are drawn from',
+        control: { type: 'select', options: [{ label: 'Gmail, Calendar, Slack, Todoist', value: 'connected' }, { label: 'No sources', value: 'none' }, { label: 'One generic source', value: 'oneGeneric' }] },
+        defaultValue: 'connected',
+      },
+      { name: 'compact', description: 'Compact (mobile) layout', control: { type: 'boolean' }, defaultValue: false },
+    ],
+    variants: [
+      { name: 'Connected sources', props: { sources: 'connected' } },
+      { name: 'No sources', props: { sources: 'none' } },
+      { name: 'One generic source', props: { sources: 'oneGeneric' } },
+      { name: 'Compact', props: { sources: 'connected', compact: true } },
+    ],
+    mockData: () => ({}),
+  },
+  {
+    id: 'task-brief',
+    name: 'TaskBrief',
+    category: 'Chat',
+    description: 'What a task session shows before its first run, instead of the new-chat empty state: goal, acceptance criteria and subtasks from task.yaml, with Run task and Edit task',
+    component: TaskBriefPreview,
+    props: [
+      { name: 'sample', description: 'task.yaml sample', control: { type: 'select', options: TASK_SPEC_SAMPLE_OPTIONS }, defaultValue: 'gitignore-the-workspace' },
+      { name: 'starting', description: 'The run call is in flight', control: { type: 'boolean' }, defaultValue: false },
+      { name: 'compact', description: 'Phone-width column', control: { type: 'boolean' }, defaultValue: false },
+    ],
+    variants: [
+      { name: 'Created by an agent', props: { sample: 'gitignore-the-workspace' } },
+      { name: 'Four subtasks', props: { sample: 'ship-the-release' } },
+      { name: 'Goal only', props: { sample: 'tidy-the-readme' } },
+      { name: 'Long markdown goal', props: { sample: 'audit-auth' } },
+      { name: 'Starting', props: { sample: 'ship-the-release', starting: true } },
+      { name: 'Compact', props: { sample: 'ship-the-release', compact: true } },
+    ],
+  },
   {
     id: 'empty-state-hint',
     name: 'EmptyStateHint',
@@ -1099,7 +1245,7 @@ export const chatComponents: ComponentEntry[] = [
       tasks: sampleBackgroundTasks,
       sessionId: 'session-playground',
       onPermissionModeChange: (mode: string) => console.log('[Playground] Permission mode changed:', mode),
-      onKillTask: (taskId: string) => console.log('[Playground] Kill task:', taskId),
+      onStopTask: (task: { id: string }) => console.log('[Playground] Stop task:', task.id),
     }),
   },
   {
@@ -1200,7 +1346,38 @@ export const chatComponents: ComponentEntry[] = [
       response: { text: 'Analysis and fixes complete. I found 23 TODO/FIXME issues, removed deprecated code, and created a modern replacement component.', isStreaming: false },
       isStreaming: false,
       isComplete: true,
+      defaultExpanded: true,
     }),
+  },
+  {
+    id: 'turn-card-continued-subagent',
+    name: 'TurnCard (Subagent from an earlier turn)',
+    category: 'Turn Cards',
+    description: 'A background subagent launched in an earlier turn keeps working: its rows form one collapsed "continued" group instead of interleaving with this turn\'s rows',
+    component: TurnCard,
+    props: [],
+    variants: [
+      { name: 'Default', props: {} },
+    ],
+    mockData: () => {
+      const t0 = Date.now() - 60_000
+      const own = (i: number, toolName: string, input: Record<string, unknown>) => ({ id: `own-${i}`, type: 'tool' as const, status: 'completed' as const, toolName, toolUseId: `own-tool-${i}`, toolInput: input, timestamp: t0 + i * 1000, depth: 0 })
+      const sub = (i: number, toolName: string, input: Record<string, unknown>) => ({ id: `sub-${i}`, type: 'tool' as const, status: 'completed' as const, toolName, toolUseId: `sub-tool-${i}`, toolInput: input, parentId: 'agent-from-earlier-turn', timestamp: t0 + i * 1000 + 500, depth: 1 })
+      return {
+        activities: [
+          own(1, 'Bash', { command: 'rg -n "View Output"', description: 'Find the View Output implementation' }),
+          sub(1, 'Read', { file_path: '/repo/ChatHeaderLabels.tsx' }),
+          own(2, 'Read', { file_path: '/repo/TaskActionMenu.tsx' }),
+          sub(2, 'Grep', { pattern: 'entryIndex' }),
+          own(3, 'Read', { file_path: '/repo/ActiveTasksBar.tsx' }),
+          sub(3, 'Bash', { command: 'bun test src/labels', description: 'Run label tests' }),
+        ],
+        response: { text: 'The menu runs getTaskOutput and shows the result in an overlay that was never wired.', isStreaming: false },
+        isStreaming: false,
+        isComplete: true,
+        defaultExpanded: true,
+      }
+    },
   },
   {
     id: 'turn-card-deep-nested',
@@ -1241,7 +1418,7 @@ export const chatComponents: ComponentEntry[] = [
     id: 'input-container',
     name: 'InputContainer',
     category: 'Chat Inputs',
-    description: 'App-like input zone with max-width layout, active option badges, labels, statuses, tasks, and full InputContainer behavior',
+    description: 'App-like input zone with max-width layout, background-task chips, the # label and status menu, and full InputContainer behavior. Session status and label chips live in the chat header.',
     component: InputContainerPlayground,
     layout: 'full',
     previewOverflow: 'visible',
@@ -1289,8 +1466,9 @@ export const chatComponents: ComponentEntry[] = [
         control: {
           type: 'select',
           options: [
-            { label: 'Sonnet 4.6', value: 'claude-sonnet-4-6' },
+            { label: 'Opus 4.8', value: 'claude-opus-4-8' },
             { label: 'Opus 4.7', value: 'claude-opus-4-7' },
+            { label: 'Sonnet 4.6', value: 'claude-sonnet-4-6' },
             { label: 'Haiku 3.5', value: 'claude-3-5-haiku-20241022' },
           ],
         },
@@ -1335,7 +1513,7 @@ export const chatComponents: ComponentEntry[] = [
       },
       {
         name: 'showStatuses',
-        description: 'Include session status badge and menu',
+        description: "Pass the session's status to the # menu (the status glyph lives in the chat header)",
         control: { type: 'boolean' },
         defaultValue: true,
       },
@@ -1406,6 +1584,24 @@ export const chatComponents: ComponentEntry[] = [
         control: { type: 'number', min: 1, max: 4, step: 1 },
         defaultValue: 2,
       },
+      {
+        name: 'showCodingMode',
+        description: 'Show the Coding mode chip next to the folder chip',
+        control: { type: 'boolean' },
+        defaultValue: true,
+      },
+      {
+        name: 'codingMode',
+        description: 'Coding mode is on for this session',
+        control: { type: 'boolean' },
+        defaultValue: false,
+      },
+      {
+        name: 'conversationStarted',
+        description: 'The session has messages: coding mode is fixed and the chip offers a new session instead',
+        control: { type: 'boolean' },
+        defaultValue: true,
+      },
     ],
     mockData: () => ({}),
     variants: [
@@ -1413,6 +1609,31 @@ export const chatComponents: ComponentEntry[] = [
         name: 'Default (Comprehensive)',
         description: 'App-like full setup with badges, labels, statuses, sources, and working directory',
         props: {},
+      },
+      {
+        name: 'Coding Mode: New Session (Off)',
+        description: 'Before the first message the Coding chip toggles the mode; turning it on asks for a new worktree (mock repos) or an existing folder',
+        props: { conversationStarted: false, codingMode: false },
+      },
+      {
+        name: 'Coding Mode: New Session (On)',
+        description: 'Coding mode turned on before the first message (accent tint)',
+        props: { conversationStarted: false, codingMode: true },
+      },
+      {
+        name: 'Coding Mode: Started Session (On)',
+        description: 'Mode is fixed once the conversation starts; the chip opens "Continue in a new standard session"',
+        props: { conversationStarted: true, codingMode: true },
+      },
+      {
+        name: 'Coding Mode: Started Session (Off)',
+        description: 'Icon-only chip in a started standard session; opens "Continue in a new Coding session"',
+        props: { conversationStarted: true, codingMode: false },
+      },
+      {
+        name: 'Coding Mode: Compact',
+        description: 'Compact/mobile composer: icon-only chip',
+        props: { compactMode: true, conversationStarted: false, codingMode: true },
       },
       {
         name: 'Working Dir History (Few)',

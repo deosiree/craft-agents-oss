@@ -301,7 +301,6 @@ export interface SessionToolContext {
   /**
    * Update user preferences. Injected by each backend:
    * - Claude: calls updatePreferences() from config/preferences.ts
-   * - Codex/session-mcp-server: writes directly to preferences.json
    * - Pi: calls updatePreferences() from config/preferences.ts
    */
   updatePreferences?(updates: Record<string, unknown>): void;
@@ -316,11 +315,22 @@ export interface SessionToolContext {
   /** Set status on a session. Defaults to current session if no ID given. Injected by backend. */
   setSessionStatus?(sessionId: string | undefined, status: string): void | Promise<void>;
 
+  /** Archive (archived=true) or unarchive (archived=false) another session by ID. Injected by backend. */
+  archiveSession?(sessionId: string, archived: boolean): void | Promise<void>;
+
   /** Get detailed info about a session. Defaults to current session if no ID given. Injected by backend. */
   getSessionInfo?(sessionId?: string): SessionInfo | null;
 
   /** List sessions in the workspace with pagination. Injected by backend. */
   listSessions?(options?: ListSessionsOptions): ListSessionsResult;
+
+  /**
+   * List background tasks (running + recently-terminal) for a session from the
+   * main-process registry. Defaults to the current session if no ID given.
+   * Injected by backend (SessionManager). Returns [] in backends that don't
+   * track background tasks.
+   */
+  listBackgroundTasks?(sessionId?: string): BackgroundTaskInfo[];
 
   /** Resolve label display names to IDs against configured labels. Injected by backend. */
   resolveLabels?(labels: string[]): ResolvedLabelsResult;
@@ -328,12 +338,84 @@ export interface SessionToolContext {
   /** Resolve a status display name to its ID against configured statuses. Injected by backend. */
   resolveStatus?(status: string): ResolvedStatusResult;
 
+  /**
+   * Create a Craft Agents Task (board card + task.yaml + orchestrator session)
+   * WITHOUT running it. Slug derivation, node synthesis, and spec validation
+   * happen behind this callback where the task primitives live. Injected by
+   * backend (SessionManager); undefined in backends that don't run alongside
+   * it (e.g. the Codex MCP subprocess) — the handler degrades gracefully.
+   */
+  createTask?(input: CreateTaskInput): Promise<CreateTaskResult>;
+
+  /**
+   * Append a dated note to the invoking session's project MEMORY.md (project_memory_append).
+   * Throws when the session has no project. Injected by SessionManager.
+   */
+  appendProjectMemory?(input: ProjectMemoryAppendInput): Promise<ProjectMemoryAppendResult>;
+
+  // ============================================================
+  // Pages (list_pages / get_page / create_page / update_page /
+  //        write_page_data / delete_page)
+  // ============================================================
+
+  /**
+   * Pages tool callbacks — workspace-scoped mini dashboards. Grouped in one
+   * object (unlike the flat session-management callbacks) because the six
+   * operations always ship together. Injected by the backend (SessionManager);
+   * undefined in backends that don't run alongside it — handlers degrade
+   * gracefully.
+   */
+  pages?: PagesToolCallbacks;
+
+  // ============================================================
+  // MCP source resources & prompts (source_list_resources /
+  //   source_read_resource / source_list_prompts / source_get_prompt)
+  // ============================================================
+
+  /**
+   * Resources and prompts of the session's MCP sources, grouped like pages.
+   * Injected by the backend (SessionManager), which only reaches the session's
+   * enabled, connected sources; undefined in backends that don't run alongside
+   * it — handlers degrade gracefully.
+   */
+  mcpSources?: McpSourceToolCallbacks;
+
+  // ============================================================
+  // Decision model (decide)
+  // ============================================================
+
+  /**
+   * Decision-layer callback for the `decide` tool (Jev / System One typed
+   * judgments over text or JSON). Injected by the backend (SessionManager)
+   * from @craft-agent/shared/decisions; undefined in backends that don't run
+   * alongside it — the handler tells the agent how the user can enable it.
+   * Answers are hints for the agent and never grant authority.
+   */
+  decide?: DecisionToolCallbacks;
+
+  // ============================================================
+  // PR watcher (pr_status / pr_bind / pr_unbind / pr_set_auto_merge)
+  // ============================================================
+
+  /**
+   * PR watcher tool callbacks for Coding mode — read a session's PRs and pin/unpin PRs to the
+   * current session. Grouped like pages; injected by the backend (SessionManager) bound to the
+   * invoking session. Undefined in backends that don't run alongside it — handlers degrade
+   * gracefully. Tokens never reach the agent; these go through the server-side watcher.
+   */
+  prWatch?: PrWatchToolCallbacks;
+
   // ============================================================
   // Inter-Session Messaging
   // ============================================================
 
-  /** Send a message to another session. Injected by backend (SessionManager). */
-  sendAgentMessage?(sessionId: string, message: string, attachments?: Array<{ path: string; name?: string }>): Promise<void>;
+  /**
+   * Send a message to another session. Injected by backend (SessionManager).
+   * Resolves with how the message was received so the sender can give the model
+   * a truthful ack (delivered immediately vs. queued behind a busy turn) instead
+   * of an unconditional "message sent".
+   */
+  sendAgentMessage?(sessionId: string, message: string, attachments?: Array<{ path: string; name?: string }>): Promise<SendAgentMessageResult>;
 
   /**
    * Activate a source in the running session: add to enabledSourceSlugs,
@@ -342,12 +424,12 @@ export interface SessionToolContext {
    * Only available in backends that run alongside SessionManager (Claude in-process, Pi subprocess).
    * Codex and other backends leave this undefined — callers should degrade gracefully (restart required).
    *
-   * `availability` is always `'next-turn'` when activation succeeds: both Claude SDK
-   * (frozen `mcpServers` at `query()` start) and Pi (subprocess reloads proxy tools
-   * on the next `handlePrompt`) require the current turn to end before new tools
-   * are callable. The backend handles this via the existing source_activated + auto_retry
-   * machinery — the current turn is aborted and the renderer resends the user's
-   * original message with a `[{slug} activated]` suffix.
+   * `availability` is always `'next-turn'` when activation succeeds: both Claude (sets
+   * each turn's MCP servers at turn start) and Pi (subprocess reloads proxy tools on the
+   * next `handlePrompt`) need a new turn before new tools are callable. The backend
+   * handles this via the existing source_activated + auto_retry machinery — the current
+   * turn ends and the server resends the user's original message with a
+   * `[{slug} activated]` suffix.
    */
   activateSourceInSession?(sourceSlug: string): Promise<{
     ok: boolean;
@@ -415,6 +497,12 @@ export interface ResolvedStatusResult {
   resolved: string | null;
   /** All valid status IDs (for error messages) */
   available: string[];
+  /**
+   * Category of the matched status ('open' | 'closed'), when resolved. Lets the
+   * status tool reject agent-driven *closed* transitions (the human owns closure)
+   * while still allowing open ones like `needs-review`.
+   */
+  category?: 'open' | 'closed';
 }
 
 // ============================================================
@@ -422,6 +510,335 @@ export interface ResolvedStatusResult {
 // ============================================================
 
 /** Full metadata for a single session (returned by get_session_info). */
+/** Input for create_task — structured fields, mapped onto a TaskSpec by the backend. */
+export interface CreateTaskInput {
+  /** Short task title shown on the board (also drives the slug). */
+  title: string;
+  /** What the task should accomplish — becomes the task goal and the initial node prompt. */
+  description: string;
+  /** Freeform rubric the final result is verified against. */
+  acceptanceCriteria?: string;
+  /** Source slugs enabled on the task's sessions. */
+  sources?: string[];
+  /** Skill slugs applied to dispatched task prompts. */
+  skills?: string[];
+  /** LLM connection slug serving `model`. */
+  llmConnection?: string;
+  /** Model id for the task's sessions (workspace default when omitted). */
+  model?: string;
+  /** Working directory for the task's sessions. */
+  workingDirectory?: string;
+  /** Project to bind the task to. Defaults to the invoking session's project. */
+  projectId?: string;
+}
+
+/** Input for project_memory_append. */
+export interface ProjectMemoryAppendInput {
+  /** Markdown note; the backend adds a dated heading naming the session. */
+  note: string;
+}
+
+/** Result of project_memory_append. */
+export interface ProjectMemoryAppendResult {
+  path: string;
+  heading: string;
+  bytesAppended: number;
+}
+
+/** Result of create_task. */
+export interface CreateTaskResult {
+  slug: string;
+  orchestratorSessionId: string;
+  taskLabelId?: string;
+  /** Fail-soft problems (unknown source/skill slugs, label failure, …). */
+  warnings: string[];
+}
+
+// ============================================================
+// Pages Types
+// ============================================================
+// Plain JSON shapes mirroring @craft-agent/core page types — duplicated here
+// on purpose so this package stays dependency-free (same rule as
+// CreateTaskInput). The backend maps real PageConfig/LoadedPage onto these.
+
+/** Scheduled refresh spec for a page (5-field cron → workspace-relative script). */
+export interface PageToolRefreshSpec {
+  /** 5-field cron expression evaluated once per minute */
+  cron: string;
+  /** Script path relative to the workspace root (must stay within it) */
+  script: string;
+  /** Extra argv appended after the script path */
+  args?: string[];
+  /** IANA timezone for cron evaluation (system local when omitted) */
+  timezone?: string;
+  /** Per-run timeout in ms (default 60_000, clamped to [1_000, 900_000]) */
+  timeoutMs?: number;
+  /** false pauses scheduling without deleting the spec */
+  enabled?: boolean;
+}
+
+/** Compact page entry (returned by list_pages). */
+export interface PageToolSummary {
+  slug: string;
+  name: string;
+  description?: string;
+  /** 'static' | 'interactive' | 'live' */
+  kind: string;
+  projectId?: string;
+  createdAt: number;
+  updatedAt: number;
+  /** Whether index.html exists yet */
+  hasContent: boolean;
+  refresh?: PageToolRefreshSpec;
+  /** Outcome of the most recent data refresh (scheduled or agent write) */
+  lastRefresh?: { at: number; ok: boolean; durationMs: number; error?: string };
+  /** Whether the page is currently published (share link exists) */
+  shared: boolean;
+  /** Absolute path to the page folder (pages/{slug}/) */
+  folderPath: string;
+}
+
+/** Summary of a page's data snapshot (kv keys + per-series stats, not full points). */
+export interface PageToolDataSummary {
+  generatedAt: number;
+  kvKeys: string[];
+  series: Array<{ name: string; points: number; latest?: { t: number; v: number } }>;
+  /** Absolute path to data/snapshot.json — Read it for the full contents */
+  snapshotPath: string;
+}
+
+/** Full page details (returned by get_page / create_page / update_page). */
+export interface PageToolDetails extends PageToolSummary {
+  id: string;
+  /** sha256 hex of index.html (grants and render leases bind to it) */
+  contentDigest?: string;
+  /** Byte length of index.html when present */
+  contentLength?: number;
+  /** Absolute path to index.html */
+  contentPath: string;
+  /** Data snapshot summary, or null when no data has been written yet */
+  data: PageToolDataSummary | null;
+  /** Source-action grants (user-approved; stale = digest mismatch or expired) */
+  grants: Array<{
+    id: string;
+    kind: string;
+    /** Source slug for api/mcp grants (absent for script grants) */
+    sourceSlug?: string;
+    /** Workspace-relative script path for script grants (absent otherwise) */
+    script?: string;
+    description?: string;
+    expiresAt: number;
+    stale: boolean;
+  }>;
+  /** Public share URL when published */
+  shareUrl?: string;
+  /** Full index.html content (only when requested with includeContent) */
+  content?: string;
+}
+
+/** Input for create_page. */
+export interface CreatePageToolInput {
+  name: string;
+  description?: string;
+  /** 'static' | 'interactive' | 'live' (default: 'interactive') */
+  kind?: string;
+  /** Stable Project ID to bind the page to */
+  projectId?: string;
+  /** Full self-contained HTML document for index.html */
+  content?: string;
+  refresh?: PageToolRefreshSpec;
+}
+
+/** Patch for update_page — only provided fields change; null clears a field. */
+export interface UpdatePageToolPatch {
+  name?: string;
+  description?: string | null;
+  kind?: string;
+  projectId?: string | null;
+  /** Replaces index.html entirely (re-digests; existing grants go stale by design) */
+  content?: string;
+  refresh?: PageToolRefreshSpec | null;
+}
+
+/** Data mutation batch for write_page_data (applied in one transaction). */
+export interface PageDataToolPatch {
+  /** KV upserts: key → any JSON value */
+  set?: Record<string, unknown>;
+  /** KV keys to delete */
+  delete?: string[];
+  /** Timeseries appends: series name → points ({ t? epoch ms, v number }) */
+  appendSeries?: Record<string, Array<{ t?: number; v: number }>>;
+  /** Timeseries prunes: series name → deleteBefore timestamp (t < value removed) */
+  pruneSeries?: Record<string, number>;
+}
+
+/** Result of write_page_data. */
+export interface PageDataWriteSummary {
+  slug: string;
+  kvCount: number;
+  seriesCount: number;
+  generatedAt: number;
+  snapshotPath: string;
+  durationMs: number;
+}
+
+/** Result of delete_page. */
+export interface DeletePageToolResult {
+  deleted: true;
+  /** True when the page was published and the remote copy may still exist */
+  publicCopyMayRemain: boolean;
+}
+
+/**
+ * Pages tool callbacks, injected by the backend (SessionManager). All storage
+ * logic lives behind these — this package never touches pages/ directly.
+ */
+export interface PagesToolCallbacks {
+  listPages(): PageToolSummary[] | Promise<PageToolSummary[]>;
+  getPage(slug: string, options?: { includeContent?: boolean }): PageToolDetails | null | Promise<PageToolDetails | null>;
+  createPage(input: CreatePageToolInput): Promise<PageToolDetails>;
+  updatePage(slug: string, patch: UpdatePageToolPatch): Promise<PageToolDetails>;
+  writePageData(slug: string, patch: PageDataToolPatch): Promise<PageDataWriteSummary>;
+  deletePage(slug: string): Promise<DeletePageToolResult>;
+}
+
+// ============================================================
+// MCP Source Resources & Prompts Types
+// ============================================================
+// Plain JSON shapes mirroring the MCP SDK types — duplicated so this package
+// stays dependency-free (same rule as pages). The backend maps the SDK objects
+// onto these, dropping icons, annotations and _meta.
+
+/** A resource an MCP server publishes (returned by source_list_resources). */
+export interface McpSourceResource {
+  uri: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+  /** Size in bytes, when the server reports it */
+  size?: number;
+}
+
+/** A parameterized resource: fill in the RFC 6570 URI template to get a readable URI. */
+export interface McpSourceResourceTemplate {
+  uriTemplate: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+}
+
+/** Result of source_list_resources. */
+export interface McpSourceResourceList {
+  resources: McpSourceResource[];
+  resourceTemplates: McpSourceResourceTemplate[];
+  /** The listing stopped at the backend's page cap while the server still had pages */
+  truncated?: boolean;
+}
+
+export interface McpSourcePromptArgument {
+  name: string;
+  description?: string;
+  required?: boolean;
+}
+
+/** A prompt an MCP server publishes (returned by source_list_prompts). */
+export interface McpSourcePrompt {
+  name: string;
+  title?: string;
+  description?: string;
+  arguments?: McpSourcePromptArgument[];
+}
+
+/** Result of source_list_prompts. */
+export interface McpSourcePromptList {
+  prompts: McpSourcePrompt[];
+  /** The listing stopped at the backend's page cap while the server still had pages */
+  truncated?: boolean;
+}
+
+/**
+ * MCP source resources/prompts callbacks, injected by the backend
+ * (SessionManager, backed by the session's MCP pool). Failures — source not
+ * enabled or not connected, API source, capability missing — are thrown with
+ * messages written for the agent.
+ */
+export interface McpSourceToolCallbacks {
+  listResources(sourceSlug: string): Promise<McpSourceResourceList>;
+  /** Resource contents as text; binary contents are saved to files, large results saved with a summary. */
+  readResource(sourceSlug: string, uri: string): Promise<string>;
+  listPrompts(sourceSlug: string): Promise<McpSourcePromptList>;
+  /** The prompt's messages, with the arguments filled in, rendered as text (role + content). */
+  getPrompt(sourceSlug: string, name: string, args?: Record<string, string>): Promise<string>;
+}
+
+// ============================================================
+// Decision Tool Types (mirror @craft-agent/shared/decisions — this package
+// must stay free of that dependency, same rule as pages)
+// ============================================================
+
+export type DecisionToolQuestionType = 'choice' | 'score' | 'noul';
+
+/** A sentence, or a small structured object such as { question, focus }. */
+export type DecisionToolInstructions = string | Record<string, unknown>;
+
+/**
+ * choice: option key → description (string, structured object, or null when self-explanatory).
+ * score: ordered array of level descriptions, lowest first.
+ * noul: optional { true, false } descriptions.
+ */
+export type DecisionToolCriteria =
+  | Record<string, string | null | Record<string, unknown>>
+  | Array<string | Record<string, unknown>>;
+
+export interface DecisionToolQuestion {
+  type: DecisionToolQuestionType;
+  instructions: DecisionToolInstructions;
+  criteria?: DecisionToolCriteria;
+}
+
+/** Text, a JSON object, or an array of text values. */
+export type DecisionToolState = string | Record<string, unknown> | unknown[];
+
+export interface DecisionToolRequest {
+  state: DecisionToolState;
+  questions: Record<string, DecisionToolQuestion>;
+  /** Wall-clock budget for the call, in ms. */
+  deadlineMs?: number;
+  /** Caller context written to the decision record (redacted by key name). Never the state. */
+  meta?: Record<string, unknown>;
+}
+
+export type DecisionToolAnswer =
+  | { type: 'choice'; choice: string; confidence: number; probabilities: Record<string, number> }
+  | { type: 'score'; score: number; confidence: number; probabilities: Record<string, number>; legend?: Record<string, unknown> }
+  | { type: 'noul'; noul: number };
+
+export interface DecisionToolUsage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/** Failure the agent may see. Never contains the API key or the state. */
+export interface DecisionToolError {
+  kind: string;
+  message: string;
+  status?: number;
+}
+
+export type DecisionToolResult =
+  | { ok: true; model: string; answers: Record<string, DecisionToolAnswer>; usage: DecisionToolUsage; latencyMs: number; truncated: boolean }
+  | { ok: false; error: DecisionToolError };
+
+/**
+ * Decision-layer callback, injected by the backend (SessionManager). Network,
+ * validation, gating and recording all live behind it.
+ */
+export interface DecisionToolCallbacks {
+  decide(request: DecisionToolRequest): Promise<DecisionToolResult>;
+}
+
 export interface SessionInfo {
   id: string;
   name: string;
@@ -431,9 +848,123 @@ export interface SessionInfo {
   createdAt: number;
   updatedAt?: number;
   workingDirectory?: string;
+  projectId?: string;
+  /** The session this one is a sub-session of (a spawned session, a task's subtask) */
+  parentSessionId?: string;
   llmConnection?: string;
   model?: string;
   isActive: boolean;
+  /** The task the session belongs to (its own session, or a subtask's) */
+  task?: SessionTaskInfo;
+}
+
+/** A task as get_session_info reports it; the content fields are absent when task.yaml can't be read. */
+export interface SessionTaskInfo {
+  slug: string;
+  /** task.yaml, the task's full spec */
+  specPath: string;
+  /** The subtask (DAG node) this session runs, for a subtask's session */
+  nodeId?: string;
+  title?: string;
+  goal?: string;
+  acceptanceCriteria?: string;
+  /** Empty when the task is a single step (its goal) */
+  subtasks?: Array<{ id: string; title: string; prompt?: string; dependsOn?: string[] }>;
+}
+
+// ============================================================
+// PR Watcher Tool Types (mirror @craft-agent/shared/protocol pr-watch — this
+// package stays dependency-free, same rule as pages)
+// ============================================================
+
+export type PrToolMergeMethod = 'merge' | 'squash' | 'rebase';
+
+/** One PR in a session's status (pr_status). */
+export interface PrToolStatus {
+  /** Stable id: host/owner/repo#number */
+  id: string;
+  origin: 'branch' | 'bound';
+  number: number;
+  title: string;
+  url: string;
+  /** open | draft | merged | closed */
+  state: string;
+  /** pending | success | failure | none */
+  checks: string;
+  /** approved | changes_requested | review_required | none */
+  reviewDecision: string;
+  /** clean | behind | blocked | conflicting | unstable | draft | unknown */
+  mergeState: string;
+  unresolvedThreads: number;
+  localAhead: number;
+  localDirty: boolean;
+  autoMerge?: { enabled: boolean; method?: PrToolMergeMethod };
+  /**
+   * Set while auto-merge is off and GitHub won't turn it on: repo-disabled (the repository has it
+   * off), draft, mergeable (nothing pending, so it can be merged now) or unavailable (e.g. no access)
+   */
+  autoMergeBlocked?: 'repo-disabled' | 'draft' | 'mergeable' | 'unavailable';
+  /** Auto-fix (the card's Fix toggle) is on: new review feedback gets fixed automatically */
+  autoFix?: boolean;
+  /** Which credential answered ("gh" or a source name) */
+  via: string;
+}
+
+export interface PrToolStatusResult {
+  /** 'ready' with prs, else why the session has none */
+  kind: 'ready' | 'none' | 'unavailable' | 'loading';
+  /** Why there are no PRs (not-git / not-github / no-token / error), when kind !== 'ready' */
+  reason?: string;
+  /** The session the status is for (defaults to the current session) */
+  sessionId: string;
+  prs: PrToolStatus[];
+  /** True when state came from persisted bindings without a live fetch (cross-session, R3). */
+  cached?: boolean;
+}
+
+export interface PrBindToolResult {
+  ok: boolean;
+  error?: string;
+  /** The bound PR's status when ok */
+  pr?: PrToolStatus;
+  /** Total PRs bound to the session after the change */
+  boundCount?: number;
+  /** Not pinned (with `skipBranchPr`): it is the folder's own branch PR */
+  skipped?: 'branch-pr';
+}
+
+export interface PrUnbindToolResult {
+  ok: boolean;
+  error?: string;
+  /** False when the ref wasn't actually bound */
+  removed?: boolean;
+  boundCount?: number;
+}
+
+export interface PrAutoMergeToolResult {
+  ok: boolean;
+  error?: string;
+  enabled?: boolean;
+  method?: PrToolMergeMethod;
+}
+
+/**
+ * PR watcher callbacks, injected by the backend (SessionManager) bound to the invoking session.
+ * Credential resolution and GitHub calls live behind these — the agent never sees a token.
+ */
+export interface PrWatchToolCallbacks {
+  /** Status of the current session's PRs, or another session's persisted PRs (cross-session, no fetch). */
+  status(input: { sessionId?: string }): Promise<PrToolStatusResult>;
+  /**
+   * Pin a PR to the current session by URL or number (verifies before persisting). `skipBranchPr`
+   * (the post-tool hook after `gh pr create`) leaves out the folder's own branch PR, which the
+   * carousel shows anyway.
+   */
+  bind(input: { ref: string; skipBranchPr?: boolean }): Promise<PrBindToolResult>;
+  /** Remove a pinned PR from the current session. */
+  unbind(input: { ref: string }): Promise<PrUnbindToolResult>;
+  /** Enable/disable GitHub auto-merge on one of the current session's PRs. */
+  setAutoMerge(input: { ref: string; enabled: boolean; method?: PrToolMergeMethod }): Promise<PrAutoMergeToolResult>;
 }
 
 /** Compact session summary (returned by list_sessions). */
@@ -443,6 +974,11 @@ export interface SessionListItem {
   labels: string[];
   status: string;
   createdAt: number;
+  projectId?: string;
+  /** Set for a sub-session */
+  parentSessionId?: string;
+  /** Set for a task's sessions: get_session_info returns the task's content */
+  taskSlug?: string;
 }
 
 /** Options for list_sessions filtering and pagination. */
@@ -460,6 +996,48 @@ export interface ListSessionsResult {
   total: number;
   returned: number;
   sessions: SessionListItem[];
+}
+
+/**
+ * Result of delivering a cross-session message (send_agent_message).
+ * Lets the sender report the truth instead of an unconditional "sent".
+ */
+export interface SendAgentMessageResult {
+  /**
+   * - `delivered`: the target was idle, so it will start processing the message now.
+   * - `queued`: the target was mid-turn; the message is enqueued and will be
+   *   processed after the current turn finishes.
+   */
+  delivery: 'delivered' | 'queued';
+  /** Whether the target session was processing a turn when the message arrived. */
+  targetBusy: boolean;
+}
+
+/**
+ * A background task tracked by the main process (returned by
+ * list_background_tasks). This is the cross-subprocess source of truth: the
+ * SDK's in-subprocess task tools only see tasks launched in the CURRENT
+ * subprocess, so they cannot report a task from a prior turn's (torn-down)
+ * subprocess. `status: 'orphaned'` means the owning turn ended before a terminal
+ * notification arrived — the task most likely died with its subprocess.
+ */
+export interface BackgroundTaskInfo {
+  taskId: string;
+  intent?: string;
+  /** What the session's agent launched: a background agent, a Workflow, a Bash command, or another task. */
+  kind?: 'agent' | 'workflow' | 'shell' | 'task';
+  status: 'running' | 'completed' | 'failed' | 'stopped' | 'orphaned';
+  /** ms timestamp when the task was backgrounded (absent for untracked tasks) */
+  startTime?: number;
+  /** seconds elapsed since start, derived at query time (absent for untracked tasks) */
+  elapsedSeconds?: number;
+  /** ms timestamp when the task reached a terminal/orphaned status, if any */
+  completedAt?: number;
+  /**
+   * A completion seen for a task this session's agent did not launch (typically a subagent's
+   * own background task); its start time is unknown.
+   */
+  untracked?: boolean;
 }
 
 // ============================================================

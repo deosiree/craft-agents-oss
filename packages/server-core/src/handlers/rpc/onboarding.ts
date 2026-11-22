@@ -5,7 +5,7 @@
  */
 import { getAuthState, getSetupNeeds } from '@craft-agent/shared/auth'
 import { getCredentialManager } from '@craft-agent/shared/credentials'
-import { setSetupDeferred } from '@craft-agent/shared/config'
+import { getDefaultLlmConnection, isSetupDeferred, setSetupDeferred } from '@craft-agent/shared/config'
 import { prepareClaudeOAuth, exchangeClaudeCode, hasValidOAuthState, clearOAuthState, prepareMcpOAuth } from '@craft-agent/shared/auth'
 import { validateMcpConnection } from '@craft-agent/shared/mcp'
 import { RPC_CHANNELS } from '@craft-agent/shared/protocol'
@@ -33,7 +33,9 @@ export function registerOnboardingHandlers(server: RpcServer, deps: HandlerDeps)
   // Get current auth state
   server.handle(RPC_CHANNELS.onboarding.GET_AUTH_STATE, async () => {
     const authState = await getAuthState()
-    const setupNeeds = getSetupNeeds(authState)
+    // Honor "Setup later" like the Electron main handler does — without the
+    // flag, headless/WebUI clients re-enter onboarding on every reload.
+    const setupNeeds = getSetupNeeds(authState, isSetupDeferred())
     // Redact raw credentials — renderer only needs boolean flags (hasCredentials, setupNeeds)
     return {
       authState: {
@@ -132,17 +134,27 @@ export function registerOnboardingHandlers(server: RpcServer, deps: HandlerDeps)
         expiresAt: tokens.expiresAt,
       })
 
-      // Also save to legacy key for validation compatibility
-      await manager.setClaudeOAuthCredentials({
-        accessToken: tokens.accessToken,
-        refreshToken: tokens.refreshToken,
-        expiresAt: tokens.expiresAt,
-        source: 'native',
-      })
+      // The legacy global slot is the default connection's fallback
+      // (auth/state.ts readClaudeOAuthCredentials), so keep it in sync for that
+      // connection only: another account there would reach the default connection.
+      if (getDefaultLlmConnection() === connectionSlug) {
+        await manager.setClaudeOAuthCredentials({
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+          expiresAt: tokens.expiresAt,
+          source: 'native',
+        })
+      }
 
       const expiresAtDate = tokens.expiresAt ? new Date(tokens.expiresAt).toISOString() : 'never'
       log.info(`[Onboarding] Claude OAuth saved to LLM connection (expires: ${expiresAtDate})`)
-      return { success: true, token: tokens.accessToken }
+      // Forward resolved identity (issue #838) so the renderer can thread it into
+      // the SETUP payload, which is where it actually gets persisted. Credentials
+      // are stored above via setLlmOAuth; identity is not a credential.
+      const identity = (tokens.account || tokens.organization)
+        ? { account: tokens.account, organization: tokens.organization }
+        : undefined
+      return { success: true, token: tokens.accessToken, identity }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error'
       log.error('[Onboarding] Exchange Claude code error:', message)

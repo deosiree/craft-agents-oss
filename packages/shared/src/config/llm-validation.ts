@@ -5,11 +5,11 @@
  * Uses the same code path as actual agent sessions (query() with maxTurns:1).
  *
  * Follows the pattern established in ClaudeAgent.runMiniCompletion() — env-based
- * credential injection, no tools, minimal system prompt.
+ * credential injection, no tools (getTextCompletionOptions), minimal system prompt.
  */
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { getDefaultOptions } from '../agent/options.ts';
+import { getTextCompletionOptions } from '../agent/options.ts';
 import { debug } from '../utils/debug.ts';
 
 export interface LlmValidationConfig {
@@ -43,33 +43,30 @@ export async function validateAnthropicConnection(
 ): Promise<LlmValidationResult> {
   debug('[llm-validation] Validating connection', { model: config.model, hasApiKey: !!config.apiKey, hasOAuth: !!config.oauthToken, baseUrl: config.baseUrl });
 
-  // Build env overrides for credentials — avoids mutating process.env
-  const envOverrides: Record<string, string> = {};
-
-  if (config.apiKey) {
-    envOverrides.ANTHROPIC_API_KEY = config.apiKey;
-    // Clear OAuth to avoid conflicts
-    envOverrides.CLAUDE_CODE_OAUTH_TOKEN = '';
-  } else if (config.oauthToken) {
-    envOverrides.CLAUDE_CODE_OAUTH_TOKEN = config.oauthToken;
-    // Clear API key to avoid conflicts
-    envOverrides.ANTHROPIC_API_KEY = '';
+  // Without credentials the CLI would sign in with the user's own Claude Code login.
+  if (!config.apiKey && !config.oauthToken) {
+    return { success: false, error: 'No API key or OAuth token to validate' };
   }
 
+  // Only the credentials under test, without mutating process.env: the CLI starts without any
+  // Claude auth variable from it, such as another session's endpoint or token.
+  const connectionEnv: Record<string, string> = config.apiKey
+    ? { ANTHROPIC_API_KEY: config.apiKey }
+    : { CLAUDE_CODE_OAUTH_TOKEN: config.oauthToken! };
+
   if (config.baseUrl) {
-    envOverrides.ANTHROPIC_BASE_URL = config.baseUrl;
+    connectionEnv.ANTHROPIC_BASE_URL = config.baseUrl;
   }
 
   const abortController = new AbortController();
 
   try {
     const options = {
-      ...getDefaultOptions(envOverrides),
+      ...getTextCompletionOptions(undefined, connectionEnv),
       model: config.model,
       maxTurns: 1,
       abortController,
       systemPrompt: 'Reply with OK.',
-      tools: [] as string[], // No tools
       persistSession: false,
     };
 

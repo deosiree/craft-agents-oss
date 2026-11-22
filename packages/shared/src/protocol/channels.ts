@@ -27,7 +27,10 @@ export const RPC_CHANNELS = {
     GET_MESSAGES: 'sessions:getMessages',
     SEND_MESSAGE: 'sessions:sendMessage',
     CANCEL: 'sessions:cancel',
+    // Legacy name of STOP_BACKGROUND_TASK for shells (older clients); same handler.
     KILL_SHELL: 'sessions:killShell',
+    GET_BACKGROUND_TASK_OUTPUT: 'sessions:getBackgroundTaskOutput',
+    STOP_BACKGROUND_TASK: 'sessions:stopBackgroundTask',
     RESPOND_TO_PERMISSION: 'sessions:respondToPermission',
     RESPOND_TO_CREDENTIAL: 'sessions:respondToCredential',
     COMMAND: 'sessions:command',
@@ -55,7 +58,20 @@ export const RPC_CHANNELS = {
     ABORT: 'transfer:abort',
   },
   tasks: {
-    GET_OUTPUT: 'tasks:getOutput',
+    // Conductor — the Tasks DAG runner.
+    VALIDATE: 'tasks:validate',
+    CREATE: 'tasks:create',
+    GENERATE: 'tasks:generate',
+    // Push: the authored spec (or an error) for an async tasks:generate, keyed by orchestratorSessionId.
+    GENERATED: 'tasks:generated',
+    RUN: 'tasks:run',
+    PAUSE: 'tasks:pause',
+    RESUME: 'tasks:resume',
+    STOP: 'tasks:stop',
+    GET: 'tasks:get',
+    LIST: 'tasks:list',
+    // Storage-backed read of a run's outcome (verdict + per-node output). Survives restart.
+    GET_RESULTS: 'tasks:getResults',
   },
   workspaces: {
     GET: 'workspaces:get',
@@ -205,6 +221,10 @@ export const RPC_CHANNELS = {
     TEST_LLM_CONNECTION_SETUP: 'settings:testLlmConnectionSetup',
     GET_DEFAULT_THINKING_LEVEL: 'settings:getDefaultThinkingLevel',
     SET_DEFAULT_THINKING_LEVEL: 'settings:setDefaultThinkingLevel',
+    GET_AUTO_COMPACT_WINDOW: 'settings:getAutoCompactWindow',
+    SET_AUTO_COMPACT_WINDOW: 'settings:setAutoCompactWindow',
+    GET_SUBAGENT_MODEL: 'settings:getSubagentModel',
+    SET_SUBAGENT_MODEL: 'settings:setSubagentModel',
     GET_NETWORK_PROXY: 'settings:getNetworkProxy',
     SET_NETWORK_PROXY: 'settings:setNetworkProxy',
     GET_SERVER_CONFIG: 'settings:getServerConfig',
@@ -243,6 +263,7 @@ export const RPC_CHANNELS = {
     START: 'oauth:start',
     COMPLETE: 'oauth:complete',
     CANCEL: 'oauth:cancel',
+    STATUS: 'oauth:status',
     REVOKE: 'oauth:revoke',
   },
   workspace: {
@@ -323,6 +344,16 @@ export const RPC_CHANNELS = {
     GET_STATUS: 'rtk:getStatus',
     GET_GAIN: 'rtk:getGain',
   },
+  decisions: {
+    GET_SETTINGS: 'decisions:getSettings',
+    SET_SETTINGS: 'decisions:setSettings',
+    GET_STATUS: 'decisions:getStatus',
+    SET_API_KEY: 'decisions:setApiKey',
+    DELETE_API_KEY: 'decisions:deleteApiKey',
+    TEST: 'decisions:test',
+    PROBE_SERVER: 'decisions:probeServer',
+    GET_USAGE: 'decisions:getUsage',
+  },
   badge: {
     REFRESH: 'badge:refresh',
     SET_ICON: 'badge:setIcon',
@@ -335,6 +366,28 @@ export const RPC_CHANNELS = {
   },
   git: {
     GET_BRANCH: 'git:getBranch',
+    /** Coding mode's worktree picker: local repos + `gh repo list` (see protocol/git-repos.ts) */
+    LIST_REPOS: 'git:listRepos',
+    /** Creates a worktree (cloning first for a GitHub-only repo) for a new Coding session */
+    CREATE_WORKTREE: 'git:createWorktree',
+  },
+  /** Coding mode PR watcher (chat header PR chip): see protocol/pr-watch.ts */
+  prWatch: {
+    SUBSCRIBE: 'prWatch:subscribe',
+    UNSUBSCRIBE: 'prWatch:unsubscribe',
+    REFRESH: 'prWatch:refresh',
+    /** Card details for one carousel entry: (sessionId, prId) */
+    GET_DETAILS: 'prWatch:getDetails',
+    /** Pin a PR to the session by URL or number (verifies before persisting) */
+    BIND: 'prWatch:bind',
+    /** Remove a pinned PR from the session */
+    UNBIND: 'prWatch:unbind',
+    /** Enable/disable GitHub auto-merge for one of the session's PRs */
+    SET_AUTO_MERGE: 'prWatch:setAutoMerge',
+    /** Turn auto-fix (the card's Fix toggle) on/off for one of the session's PRs: (sessionId, prId, enabled) */
+    SET_AUTO_FIX: 'prWatch:setAutoFix',
+    /** Server → client push: (sessionId, PrWatchSessionState) */
+    CHANGED: 'prWatch:changed',
   },
   gitbash: {
     CHECK: 'gitbash:check',
@@ -377,6 +430,43 @@ export const RPC_CHANNELS = {
   resources: {
     EXPORT: 'resources:export',
     IMPORT: 'resources:import',
+  },
+  projects: {
+    GET: 'projects:get',
+    GET_ONE: 'projects:getOne',
+    CREATE: 'projects:create',
+    UPDATE: 'projects:update',
+    DELETE: 'projects:delete',
+    LIST_ASSETS: 'projects:listAssets',
+    UPLOAD_ASSET: 'projects:uploadAsset',
+    DELETE_ASSET: 'projects:deleteAsset',
+    CHANGED: 'projects:changed',
+  },
+  pages: {
+    GET: 'pages:get',
+    GET_ONE: 'pages:getOne',
+    CREATE: 'pages:create',
+    UPDATE: 'pages:update',
+    DELETE: 'pages:delete',
+    GET_CONTENT: 'pages:getContent',
+    SET_CONTENT: 'pages:setContent',
+    GET_DATA: 'pages:getData',
+    LIST_GRANTS: 'pages:listGrants',
+    ISSUE_GRANT: 'pages:issueGrant',
+    REVOKE_GRANT: 'pages:revokeGrant',
+    CREATE_LEASE: 'pages:createLease',
+    RELEASE_LEASE: 'pages:releaseLease',
+    EXECUTE_ACTION: 'pages:executeAction',
+    CANCEL_ACTION: 'pages:cancelAction',
+    GET_SHARE_CAPABILITIES: 'pages:getShareCapabilities',
+    GET_SHARE_DATA_SCAN: 'pages:getShareDataScan',
+    PUBLISH: 'pages:publish',
+    SET_PUBLICATION_PASSWORD: 'pages:setPublicationPassword',
+    UNPUBLISH: 'pages:unpublish',
+    PUBLISH_CLAUDE_ARTIFACT: 'pages:publishClaudeArtifact',
+    GET_THUMBNAIL: 'pages:getThumbnail',
+    REGENERATE_THUMBNAIL: 'pages:regenerateThumbnail',
+    CHANGED: 'pages:changed',
   },
   messaging: {
     // WhatsApp subprocess → Gateway (subprocess invokes on server)

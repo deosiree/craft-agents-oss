@@ -5,7 +5,12 @@
  * All agent events flow through a single pure function for consistent state transitions.
  */
 
-import type { Session, Message, PermissionRequest, CredentialRequest, TypedError, PermissionMode, SessionStatus, AuthRequest, ToolDisplayMeta } from '../../shared/types'
+import type { Session, SessionEvent, Message, PermissionRequest, CredentialRequest, TypedError, PermissionMode, SessionStatus, AuthRequest, ToolDisplayMeta } from '../../shared/types'
+
+/** Explicit SDK retry boundaries; keep their transport shape authoritative. */
+export type TextDiscardEvent = Extract<SessionEvent, { type: 'text_discard' }>
+export type RetryEvent = Extract<SessionEvent, { type: 'retry' }>
+export type MessagesRetractedEvent = Extract<SessionEvent, { type: 'messages_retracted' }>
 
 /**
  * Streaming state for a session - replaces streamingTextRef
@@ -84,6 +89,8 @@ export interface ToolResultEvent {
   parentToolUseId?: string
   /** Timestamp from main process for consistent ordering */
   timestamp?: number
+  /** Replaces the input from tool_start (a browser_tool password fill, redacted once its result is known) */
+  toolInput?: Record<string, unknown>
 }
 
 /**
@@ -95,6 +102,13 @@ export interface CompleteEvent {
   tokenUsage?: Session['tokenUsage']
   /** Explicit unread flag - set by main process based on viewing state */
   hasUnread?: boolean
+  /**
+   * WS2 keep-alive: true when the session's persistent query stays open across
+   * turns (`CRAFT_KEEP_BG_AGENTS_ALIVE`). When set, the turn ending does NOT tear
+   * down background sub-agents — so the chip orphan-backstop must NOT fire on this
+   * `complete`; a real `task_completed` will arrive when the agent actually finishes.
+   */
+  backgroundTasksAlive?: boolean
 }
 
 /**
@@ -132,6 +146,15 @@ export interface SourcesChangedEvent {
 }
 
 /**
+ * Coding mode changed event (only before the conversation starts; see SessionManager.setSessionCodingMode)
+ */
+export interface CodingModeChangedEvent {
+  type: 'coding_mode_changed'
+  sessionId: string
+  codingMode: boolean
+}
+
+/**
  * Labels changed event
  */
 export interface LabelsChangedEvent {
@@ -141,12 +164,31 @@ export interface LabelsChangedEvent {
 }
 
 /**
+ * Project id changed event (session bound/unbound to a workspace project)
+ */
+export interface ProjectIdChangedEvent {
+  type: 'project_id_changed'
+  sessionId: string
+  projectId: string | null
+}
+
+/**
  * Todo state changed event (external metadata change or agent tool)
  */
 export interface SessionStatusChangedEvent {
   type: 'session_status_changed'
   sessionId: string
   sessionStatus?: string
+}
+
+/**
+ * Session metadata changed event — generic live push for programmatic metadata writes
+ * (taskNodeCount, kanbanColumn) that don't ride the header-signature file-watch path.
+ */
+export interface SessionMetadataChangedEvent {
+  type: 'session_metadata_changed'
+  sessionId: string
+  changes: Partial<Pick<Session, 'taskNodeCount' | 'kanbanColumn' | 'taskDraft' | 'taskSlug' | 'projectId'>>
 }
 
 /**
@@ -341,6 +383,37 @@ export interface TaskBackgroundedEvent {
   taskId: string
   intent?: string
   turnId?: string
+  /** 'workflow' marks a fan-out Workflow launch (many sub-agents); undefined = a single Agent/Task. */
+  kind?: 'workflow'
+  /** Workflow run id (wf_...) — correlates workflow_agent_completed events to this chip. */
+  workflowId?: string
+}
+
+/**
+ * Workflow agent completed - one sub-agent of a running Workflow finished.
+ * Increments the owning workflow chip's completed-agent count.
+ */
+export interface WorkflowAgentCompletedEvent {
+  type: 'workflow_agent_completed'
+  sessionId: string
+  workflowId: string
+  agentId: string
+  turnId?: string
+}
+
+/**
+ * Task activity - what a running background task is doing (live summary, step count). The chip is
+ * updated in App.tsx's handleBackgroundTaskEvent; messages and session state do not change.
+ */
+export interface TaskActivityEvent {
+  type: 'task_activity'
+  sessionId: string
+  taskId: string
+  toolUseId?: string
+  summary?: string
+  lastToolName?: string
+  toolUses?: number
+  turnId?: string
 }
 
 /**
@@ -463,16 +536,16 @@ export interface SourceActivatedEvent {
 export interface UsageUpdateEvent {
   type: 'usage_update'
   sessionId: string
-  tokenUsage: {
-    inputTokens: number
-    contextWindow?: number
-  }
+  tokenUsage: Pick<NonNullable<Session['tokenUsage']>, 'inputTokens' | 'contextWindow' | 'contextUsage'>
 }
 
 /**
  * Union of all agent events
  */
 export type AgentEvent =
+  | TextDiscardEvent
+  | MessagesRetractedEvent
+  | RetryEvent
   | TextDeltaEvent
   | TextCompleteEvent
   | ToolStartEvent
@@ -483,8 +556,11 @@ export type AgentEvent =
   | PermissionRequestEvent
   | CredentialRequestEvent
   | SourcesChangedEvent
+  | CodingModeChangedEvent
   | LabelsChangedEvent
+  | ProjectIdChangedEvent
   | SessionStatusChangedEvent
+  | SessionMetadataChangedEvent
   | SessionFlaggedEvent
   | SessionUnflaggedEvent
   | SessionArchivedEvent
@@ -506,6 +582,8 @@ export type AgentEvent =
   | ShellBackgroundedEvent
   | TaskProgressEvent
   | TaskCompletedEvent
+  | TaskActivityEvent
+  | WorkflowAgentCompletedEvent
   | UserMessageEvent
   | MessageAnnotationsUpdatedEvent
   | SessionSharedEvent
@@ -523,6 +601,7 @@ export type Effect =
   | { type: 'credential_request'; request: CredentialRequest }
   | { type: 'generate_title'; sessionId: string; userMessage: string }
   | { type: 'permission_mode_changed'; sessionId: string; permissionMode: PermissionMode; previousPermissionMode?: PermissionMode; transitionDisplay?: string; modeVersion?: number; changedAt?: string; changedBy?: 'user' | 'system' | 'restore' | 'automation' | 'unknown' }
+  | { type: 'coding_mode_changed'; sessionId: string; codingMode: boolean }
   | { type: 'restore_input'; text: string }
   | { type: 'toast_error'; message: string }
 

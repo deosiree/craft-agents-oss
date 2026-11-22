@@ -4,7 +4,10 @@
 
 export { Markdown, MemoizedMarkdown, type MarkdownProps, type RenderMode, type DisablablePreviewBlock } from './Markdown'
 export { CodeBlock, InlineCode, type CodeBlockProps } from './CodeBlock'
+export { RunCommandProvider, useRunCommand, type RunCommandHandler } from './RunCommandContext'
+export { shellCommandFromBlock, consoleSnippetCommand } from './shell-command'
 export { preprocessLinks, detectLinks, hasLinks } from './linkify'
+export { describeFileLinkClick, type FileLinkClick, type FileOpenHandler } from './link-target'
 export { CollapsibleSection } from './CollapsibleSection'
 export { CollapsibleMarkdownProvider, useCollapsibleMarkdown } from './CollapsibleMarkdownContext'
 export { MarkdownDatatableBlock, type MarkdownDatatableBlockProps } from './MarkdownDatatableBlock'

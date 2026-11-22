@@ -4,7 +4,7 @@
  * Creates the appropriate AI agent based on configuration.
  * Supports two agents:
  * - ClaudeAgent (Anthropic) - Default, using @anthropic-ai/claude-agent-sdk
- * - PiAgent (Pi) - Using @mariozechner/pi-ai SDK
+ * - PiAgent (Pi) - Using @earendil-works/pi-ai SDK
  *
  * All agents implement AgentBackend directly.
  *
@@ -39,7 +39,7 @@ import {
 import { parseValidationError, type LlmValidationResult } from '../../config/llm-validation.ts';
 import type { ModelFetchResult } from '../../config/model-fetcher.ts';
 // Model resolution utilities
-import { getModelProvider, DEFAULT_MODEL } from '../../config/models.ts';
+import { getModelProvider, DEFAULT_MODEL, normalizeDeprecatedModelId } from '../../config/models.ts';
 import { homedir } from 'node:os';
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -632,17 +632,32 @@ export function resolveModelForProvider(
   // Cross-provider guard: if the model belongs to a different provider, fall back
   // to the connection's default. This prevents e.g. sending a Claude model to Pi.
   if (managedModel) {
+    managedModel = normalizeDeprecatedModelId(managedModel);
     const modelProvider = getModelProvider(managedModel);
     if (modelProvider && modelProvider !== provider) {
       managedModel = undefined; // Clear — will fall through to connection default
     }
   }
 
+  let connectionDefault = connection?.defaultModel
+    ? normalizeDeprecatedModelId(connection.defaultModel)
+    : undefined;
+
+  if (provider === 'pi' && connection?.models?.length) {
+    const connectionModelIds = connection.models.map(m => typeof m === 'string' ? m : m.id);
+    if (managedModel && !connectionModelIds.includes(managedModel)) {
+      managedModel = undefined;
+    }
+    if (connectionDefault && !connectionModelIds.includes(connectionDefault)) {
+      connectionDefault = connectionModelIds[0];
+    }
+  }
+
   switch (provider) {
     case 'pi':
-      return managedModel || connection?.defaultModel || '';
+      return managedModel || connectionDefault || '';
     default:
-      return managedModel || connection?.defaultModel || DEFAULT_MODEL;
+      return managedModel || connectionDefault || DEFAULT_MODEL;
   }
 }
 
@@ -743,7 +758,9 @@ export async function testBackendConnection(args: {
         session: { id: `test-${now}`, workspaceRootPath: cwd, createdAt: 0, lastUsedAt: 0 },
         isHeadless: true,
         miniModel: testModel,
-        envOverrides: args.provider === 'anthropic'
+        // Only the key under test: an endpoint or token another session left in process.env
+        // would decide the result otherwise.
+        connectionEnv: args.provider === 'anthropic'
           ? {
             ANTHROPIC_API_KEY: trimmedKey,
             ...(args.baseUrl?.trim() ? { ANTHROPIC_BASE_URL: args.baseUrl.trim() } : {}),

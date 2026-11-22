@@ -96,6 +96,46 @@ export function extractLabelId(entry: string): string {
 }
 
 /**
+ * Session label entries compared by meaning rather than spelling — the dedupe rule for labels the
+ * app writes (auto-label rules, canonicalizeSessionLabels):
+ * - a plain entry (`bug`, or `bug::` with an empty value) is present when the session carries the
+ *   label in any form, so the `bug::bug` / `bug::Bug` values older auto-labelling stored on plain
+ *   labels count as `bug`;
+ * - a valued entry is present when the label carries the same value. Values compare exactly unless
+ *   `foldsCase(labelId)` says otherwise — `foldsValueCase(labels)` folds `string` values (issue keys,
+ *   emails, names: `CRA-1` is `cra-1`) and keeps links, numbers and dates exact.
+ */
+export class LabelEntrySet {
+  private readonly ids = new Set<string>();
+  private readonly values = new Set<string>();
+
+  constructor(
+    entries: readonly string[] | ReadonlySet<string> = [],
+    private readonly foldsCase: (labelId: string) => boolean = () => false,
+  ) {
+    for (const entry of entries) this.add(entry);
+  }
+
+  add(entry: string): void {
+    const id = extractLabelId(entry);
+    const value = entryValue(entry);
+    this.ids.add(id);
+    if (value) this.values.add(this.valueKey(id, value));
+  }
+
+  has(entry: string): boolean {
+    const id = extractLabelId(entry);
+    const value = entryValue(entry);
+    return value ? this.values.has(this.valueKey(id, value)) : this.ids.has(id);
+  }
+
+  /** Identity of a label value (an id never contains the separator, so the pair is unambiguous). */
+  private valueKey(id: string, value: string): string {
+    return `${id}${VALUE_SEPARATOR}${this.foldsCase(id) ? value.toLowerCase() : value}`;
+  }
+}
+
+/**
  * Toggle a label in a session-labels list. Returns a new array.
  *
  * - If any entry has this base ID (boolean or valued), all matching
@@ -118,6 +158,7 @@ export function toggleLabelInList(labels: string[], labelId: string): string[] {
  * Check whether `rawValue` is well-formed for the declared `valueType`.
  *
  * - `string` — always valid
+ * - `link`   — always valid (a URL string; protocol safety enforced at open time)
  * - `number` — matches DECIMAL_NUMBER_REGEX (rejects hex/octal/scientific)
  * - `date`   — ISO date (YYYY-MM-DD) or datetime (YYYY-MM-DDTHH:mm), with a
  *              round-trip check so `2026-02-29` doesn't silently clamp.
@@ -127,10 +168,13 @@ export function toggleLabelInList(labels: string[], labelId: string): string[] {
  */
 export function validateLabelValue(
   rawValue: string,
-  valueType: 'string' | 'number' | 'date',
+  valueType: 'string' | 'number' | 'date' | 'link',
 ): boolean {
   switch (valueType) {
     case 'string':
+    case 'link':
+      // `link` validates like a string; URL/protocol safety is enforced at
+      // open time by the renderer's shell:openUrl IPC (http/https/mailto only).
       return true;
     case 'number':
       return DECIMAL_NUMBER_REGEX.test(rawValue);
@@ -150,10 +194,11 @@ export function validateLabelValue(
 
 /**
  * Format a raw label value for human-readable display.
- * Dates get locale-formatted (e.g. "Jan 30, 2026"), numbers and strings pass through.
+ * Dates get locale-formatted (e.g. "Jan 30, 2026"); links get their scheme
+ * stripped (e.g. "example.com/x"); numbers and strings pass through.
  * Used by UI badge components to render the value portion after the interpunct.
  */
-export function formatDisplayValue(rawValue: string, valueType?: 'string' | 'number' | 'date'): string {
+export function formatDisplayValue(rawValue: string, valueType?: 'string' | 'number' | 'date' | 'link'): string {
   if (valueType === 'date') {
     // Parse date-only or datetime strings (matching the storage formats in parseLabelEntry)
     const date = new Date(rawValue.includes('T') ? rawValue + ':00Z' : rawValue + 'T00:00:00Z');
@@ -161,12 +206,24 @@ export function formatDisplayValue(rawValue: string, valueType?: 'string' | 'num
       return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     }
   }
+  if (valueType === 'link') {
+    // Strip the scheme and any trailing slash for a cleaner chip — e.g.
+    // "https://example.com/x/" → "example.com/x". The raw value stays the
+    // openable href (see openLabelLink); this only affects display.
+    return rawValue.replace(/^https?:\/\//i, '').replace(/\/$/, '');
+  }
   return rawValue;
 }
 
 // ============================================================
 // Internal Helpers
 // ============================================================
+
+/** The raw value of an entry ('' for a plain entry). */
+function entryValue(entry: string): string {
+  const separatorIndex = entry.indexOf(VALUE_SEPARATOR);
+  return separatorIndex === -1 ? '' : entry.substring(separatorIndex + VALUE_SEPARATOR.length);
+}
 
 /**
  * Infer the typed value from a raw string.

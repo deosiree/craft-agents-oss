@@ -22,6 +22,10 @@ import type {
   PermissionModeState,
   UnreadSummary,
   ShareResult,
+  BackgroundTaskOutput,
+  StopBackgroundTaskResult,
+  BoundPr,
+  PrMonitorState,
 } from '@craft-agent/shared/protocol'
 import type { SessionBundle, DispatchMode } from '@craft-agent/shared/sessions'
 import type { EventSink } from '../transport'
@@ -32,6 +36,10 @@ export interface ISessionManager {
   // ---------------------------------------------------------------------------
 
   waitForInit(): Promise<void>
+  /** Resolves once the background disk load has populated the session map (or
+   *  failed). List endpoints await this instead of waitForInit, which now only
+   *  guarantees fast-path init (migrations, auth, config watchers). */
+  waitForSessionsLoaded(): Promise<void>
   initialize(): Promise<void>
   cleanup(): void
   setEventSink(sink: EventSink): void
@@ -43,7 +51,21 @@ export interface ISessionManager {
 
   getSessions(workspaceId?: string): Session[]
   getSession(sessionId: string): Promise<Session | null>
-  createSession(workspaceId: string, options?: CreateSessionOptions): Promise<Session>
+  /** Creates a session and (unless `internal.emitCreatedEvent === false`) announces it to the
+   *  renderer so it hydrates full metadata instead of fabricating a "New Chat" placeholder. */
+  createSession(
+    workspaceId: string,
+    options?: CreateSessionOptions,
+    internal?: { emitCreatedEvent?: boolean },
+  ): Promise<Session>
+  /** Resolved working directory of a live session (Tasks Conductor uses it so children inherit
+   *  the orchestrator's cwd). */
+  getSessionWorkingDirectory(sessionId: string): string | undefined
+  /** Parent of a live sub-session (the Tasks Conductor refuses to run on one). */
+  getSessionParentId(sessionId: string): string | undefined
+  /** Calls `listener(sessionId)` each time a session's turn completes; returns an unsubscribe.
+   *  (The PR watcher refetches then: a turn is when pushes and `gh pr create` happen.) */
+  onTurnComplete?(listener: (sessionId: string) => void): () => void
   deleteSession(sessionId: string): Promise<void>
 
   // ---------------------------------------------------------------------------
@@ -68,9 +90,47 @@ export interface ISessionManager {
 
   setSessionPermissionMode(sessionId: string, mode: PermissionMode): void
   setSessionThinkingLevel(sessionId: string, level: ThinkingLevel): void
+  setSessionCodingMode(sessionId: string, enabled: boolean): void
+  continueSessionInNewSession(sessionId: string, codingMode: boolean): Promise<{ sessionId: string }>
+  /** Coding mode: PRs pinned to a session (chat-header PR carousel, in addedAt order). */
+  getSessionBoundPrs(sessionId: string): BoundPr[]
+  /** Pin a PR to a session (deduped by host/owner/repo#number); persists and returns the new list. */
+  bindPrToSession(sessionId: string, pr: BoundPr): BoundPr[]
+  /** Remove a pinned PR from a session (and its auto-fix state); persists and returns the new list. */
+  unbindPrFromSession(sessionId: string, pr: { host: string; owner: string; repo: string; number: number }): BoundPr[]
+  /** Coding mode: per-PR monitor state (auto-fix), keyed by PR id. */
+  getSessionPrMonitors(sessionId: string): Record<string, PrMonitorState>
+  /** Turn auto-fix on/off for one PR of a session; persists and returns the monitors. */
+  setSessionPrAutoFix(sessionId: string, prId: string, enabled: boolean): Record<string, PrMonitorState>
+  /** Record an auto-fix run (time + the review signature it acted on). */
+  recordPrAutoFixRun(sessionId: string, prId: string, signature: string[], at: number): void
+  /** A session's metadata without loading its messages (cheap, unlike getSession). */
+  getSessionSnapshot(sessionId: string): Session | null
+  /** Start a hidden, app-labelled turn in an idle session; false (nothing sent) when missing or busy. */
+  wakeIdleSessionWithNotice(sessionId: string, text: string): boolean
   updateWorkingDirectory(sessionId: string, path: string): void
   setSessionSources(sessionId: string, sourceSlugs: string[]): Promise<void>
   setSessionLabels(sessionId: string, labels: string[]): void
+  /** Apply the reserved Task labeling (mint / inherit the per-task item label under the Task
+   *  root). Returns the resolved ITEM label id, or undefined if the session is unknown.
+   *  See SessionManager.applyTaskLabel. */
+  applyTaskLabel(
+    sessionId: string,
+    opts?: { parentSessionId?: string },
+  ): Promise<{ labelId: string } | undefined>
+  setSessionProjectId(sessionId: string, projectId: string | null): Promise<void>
+  setKanbanColumn(sessionId: string, column: string | null): Promise<void>
+  setTaskNodeCount(sessionId: string, count: number): Promise<void>
+  adoptGeneratedTaskOrchestrator(
+    sessionId: string,
+    taskSlug: string,
+    reconcile?: { name?: string; projectId?: string; workingDirectory?: string; model?: string; llmConnection?: string; permissionMode?: PermissionMode },
+  ): Promise<boolean>
+  bindExistingSessionToTask(
+    sessionId: string,
+    taskSlug: string,
+    reconcile?: { name?: string; projectId?: string; workingDirectory?: string; model?: string; llmConnection?: string; permissionMode?: PermissionMode },
+  ): Promise<boolean>
   setSessionConnection(sessionId: string, connectionSlug: string): Promise<void>
   updateSessionModel(sessionId: string, workspaceId: string, model: string | null, connection?: string): Promise<void>
 
@@ -90,8 +150,22 @@ export interface ISessionManager {
     rpcContext?: { callerClientId?: string },
   ): Promise<void>
   cancelProcessing(sessionId: string, silent?: boolean): Promise<void>
-  killShell(sessionId: string, shellId: string): Promise<{ success: boolean; error?: string }>
-  getTaskOutput(taskId: string): Promise<string | null>
+  /** What a background task of the session has written so far, digested; null when there is nothing to read. */
+  getBackgroundTaskOutput(sessionId: string, taskId: string, kind?: 'agent' | 'shell' | 'workflow'): Promise<BackgroundTaskOutput | null>
+  /** Stop one background task (shell, agent or workflow) of the session through its live agent. */
+  stopBackgroundTask(sessionId: string, taskId: string): Promise<StopBackgroundTaskResult>
+
+  // --- Tasks Conductor seams (in-process; not renderer events, not agent-facing) ---
+  /**
+   * Subscribe to the in-process session-completion signal. Fires once per turn
+   * when the session's message queue drains (true completion), carrying the stop
+   * reason. Returns an unsubscribe function.
+   */
+  onSessionComplete(
+    listener: (evt: import('../sessions/SessionManager').SessionCompletionEvent) => void,
+  ): () => void
+  /** Called for every event a session's agent emits; lets callers time out only a stalled turn. */
+  onSessionActivity(sessionId: string, listener: () => void): () => void
   addMessageAnnotation(sessionId: string, messageId: string, annotation: AnnotationV1): void
   removeMessageAnnotation(sessionId: string, messageId: string, annotationId: string): void
   updateMessageAnnotation(
@@ -120,7 +194,7 @@ export interface ISessionManager {
   // ---------------------------------------------------------------------------
 
   setPendingPlanExecution(sessionId: string, planPath: string, draftInputSnapshot?: string): Promise<void>
-  markPendingPlanExecutionDispatched(sessionId: string): Promise<void>
+  markPendingPlanExecutionDispatched(sessionId: string): Promise<boolean>
   clearPendingPlanExecution(sessionId: string): Promise<void>
   getPendingPlanExecution(sessionId: string): { planPath: string; draftInputSnapshot?: string; awaitingCompaction: boolean; executionDispatched: boolean } | null
   markCompactionComplete(sessionId: string): Promise<void>
@@ -206,6 +280,13 @@ export interface ISessionManager {
    */
   notifyConfigFileChange(workspaceRootPath: string, relativePath: string): void
 
+  /**
+   * Request a (re)capture of a page's preview poster. No-op unless a capturer
+   * was injected (Electron main only); headless/WebUI hosts fall back to the
+   * placeholder tile.
+   */
+  enqueuePageThumbnail(workspaceId: string, workspaceRootPath: string, slug: string): void
+
   // ---------------------------------------------------------------------------
   // Server-level observability
   // ---------------------------------------------------------------------------
@@ -229,6 +310,17 @@ export interface ISessionManager {
    */
   refreshConnectionRuntime(connectionSlug: string): Promise<void>
   completeAuthRequest(sessionId: string, result: AuthResult): Promise<void>
+  /**
+   * After a successful OAuth sign-in for a source, complete the auth request of every session
+   * in the workspace waiting on it and resume each one. `boundRequests` are the cards that
+   * started or joined the sign-in. Returns the ids of the sessions it resumed.
+   */
+  completeAuthRequestsForSource(
+    workspaceId: string,
+    sourceSlug: string,
+    result: { email?: string; workspace?: string },
+    boundRequests?: Array<{ sessionId: string; authRequestId: string }>,
+  ): string[]
   executePromptAutomation(input: ExecutePromptAutomationInput): Promise<{ sessionId: string }>
 
   /**
@@ -262,10 +354,24 @@ export interface ExecutePromptAutomationInput {
   /** Override the workspace default thinking level for the spawned session. */
   thinkingLevel?: ThinkingLevel
   automationName?: string
+  /** Matcher id of the automation (stored on the session for the loop guard). */
+  automationId?: string
+  /** Event that fired the automation. */
+  triggerEvent?: string
+  /** Chain depth of the new session (see `automationLoopGuard`); 1 when omitted. */
+  chainDepth?: number
   /**
    * Optional Telegram forum-topic name. When set and the workspace has a
    * paired supergroup, the new session is bound to a topic of this name
    * (created on first use). Silently ignored when prerequisites aren't met.
    */
   telegramTopic?: string
+  /**
+   * When `false`, `executePromptAutomation` returns as soon as the session is
+   * created and the prompt is dispatched, instead of awaiting the whole turn.
+   * Used by the automation **Test** action so a long run (tools / >30s output)
+   * doesn't trip the RPC client timeout (craft-agents-oss#943). The session
+   * still streams live and run errors are logged. Defaults to awaiting completion.
+   */
+  waitForCompletion?: boolean
 }

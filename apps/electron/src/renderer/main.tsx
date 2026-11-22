@@ -8,13 +8,33 @@ import App from './App'
 import { ThemeProvider } from './context/ThemeContext'
 import { windowWorkspaceIdAtom } from './atoms/sessions'
 import { Toaster } from '@/components/ui/sonner'
-import { setupI18n } from '@craft-agent/shared/i18n'
+import { setupI18n, i18n } from '@craft-agent/shared/i18n'
+import { redactSensitiveHeadersInPlace, redactSensitiveKeysInPlace } from '@craft-agent/shared/utils/redaction'
 import { initReactI18next } from 'react-i18next'
 import LanguageDetector from 'i18next-browser-languagedetector'
 import './index.css'
 
 // Initialize i18n before any React rendering
 setupI18n([LanguageDetector, initReactI18next])
+
+// One-shot bootstrap: ensure the main process's i18n + preferences.json learn
+// the language we just restored from localStorage. The main-process IPC handler
+// validates the code and persists idempotently, so this is safe to run on every
+// renderer startup. Without this push, a freshly-installed (or freshly-upgraded)
+// app would still generate titles in English until the user manually re-picks
+// the language in Appearance.
+const resolvedLanguage = i18n.resolvedLanguage
+// Diagnostic: console-log the bootstrap push so it shows up in DevTools and
+// (via captureConsoleIntegration) in Sentry, alongside the main-process
+// [i18n] startup hydration log. If these two diverge, the renderer's
+// localStorage isn't tracking the user's Appearance selection.
+console.info('[i18n] renderer bootstrap push', {
+  resolvedLanguage: resolvedLanguage ?? null,
+  localStorageI18nextLng: typeof window !== 'undefined' ? window.localStorage?.getItem('i18nextLng') : null,
+})
+if (resolvedLanguage) {
+  void window.electronAPI?.changeLanguage?.(resolvedLanguage)
+}
 
 // Known-harmless console messages that should NOT be sent to Sentry.
 // These are dev-mode noise or expected warnings that aren't actionable.
@@ -45,23 +65,16 @@ sentryInit(
         return null
       }
 
-      // Scrub sensitive data from breadcrumbs (mirrors main process scrubbing in main/index.ts)
+      // Scrub sensitive data (shared logic with the main process hook).
+      // The header scrub was previously missing here — renderer drift, fixed
+      // by moving both hooks onto @craft-agent/shared/utils redaction.ts.
+      if (event.request?.headers) {
+        redactSensitiveHeadersInPlace(event.request.headers)
+      }
       if (event.breadcrumbs) {
         for (const breadcrumb of event.breadcrumbs) {
           if (breadcrumb.data) {
-            for (const key of Object.keys(breadcrumb.data)) {
-              const lowerKey = key.toLowerCase()
-              if (
-                lowerKey.includes('token') ||
-                lowerKey.includes('key') ||
-                lowerKey.includes('secret') ||
-                lowerKey.includes('password') ||
-                lowerKey.includes('credential') ||
-                lowerKey.includes('auth')
-              ) {
-                breadcrumb.data[key] = '[REDACTED]'
-              }
-            }
+            redactSensitiveKeysInPlace(breadcrumb.data)
           }
         }
       }
@@ -79,13 +92,13 @@ sentryInit(
 function CrashFallback() {
   return (
     <div className="flex flex-col items-center justify-center h-screen font-sans text-foreground/50 gap-3">
-      <p className="text-base font-medium">Something went wrong</p>
-      <p className="text-[13px]">Please restart the app. The error has been reported.</p>
+      <p className="text-base font-medium">{i18n.t('crash.somethingWentWrong')}</p>
+      <p className="text-[13px]">{i18n.t('crash.restartPrompt')}</p>
       <button
         onClick={() => window.location.reload()}
         className="mt-2 px-4 py-1.5 rounded-md bg-background shadow-minimal text-[13px] text-foreground/70 cursor-pointer"
       >
-        Reload
+        {i18n.t('crash.reload')}
       </button>
     </div>
   )

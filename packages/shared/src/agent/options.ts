@@ -4,6 +4,7 @@ import { homedir } from "os";
 import { existsSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from "fs";
 import { debug } from "../utils/debug";
 import { getProxyEnvVars } from "../config/proxy-env.ts";
+import { getGitBashPath } from "../config/storage.ts";
 
 declare const CRAFT_AGENT_CLI_VERSION: string | undefined;
 
@@ -18,9 +19,9 @@ const UTF8_BOM = '\uFEFF';
  * Ensure ~/.claude.json exists and contains valid, BOM-free JSON before
  * the SDK subprocess starts.
  *
- * Background: The SDK's cli.js reads this file on startup. If it's missing
+ * Background: The SDK's Claude Code executable reads this file on startup. If it's missing
  * (with a .backup file present), empty, BOM-prefixed, or contains invalid JSON,
- * the CLI writes plain-text error/recovery messages to process.stdout.
+ * the executable writes plain-text error/recovery messages to process.stdout.
  * The SDK transport expects only JSON on stdout, so any plain text causes:
  *   "CLI output was not valid JSON"
  *
@@ -40,8 +41,8 @@ function ensureClaudeConfig(): void {
     const configPath = join(homedir(), '.claude.json');
 
     // Clean up stale .backup file — if present and .claude.json is missing,
-    // the CLI writes "A backup file exists at..." to stdout, crashing the SDK.
-    // We remove it so the CLI sees a clean "missing file" state (which it handles silently).
+    // the Claude Code executable writes "A backup file exists at..." to stdout, crashing the SDK.
+    // We remove it so the executable sees a clean "missing file" state (which it handles silently).
     const backupPath = `${configPath}.backup`;
     if (existsSync(backupPath)) {
         try {
@@ -53,7 +54,7 @@ function ensureClaudeConfig(): void {
     }
 
     // Clean up .corrupted.* files — these accumulate on Windows and signal
-    // to the CLI that a previous corruption was detected, altering its stdout output.
+    // to Claude Code that a previous corruption was detected, altering its stdout output.
     try {
         const homeDir = homedir();
         const files = readdirSync(homeDir);
@@ -175,15 +176,50 @@ export function getPathToClaudeCodeExecutable(): string | undefined {
 }
 
 /**
+ * Env vars that carry Claude credentials or API routing. The host env may hold another
+ * connection's values: those `ClaudeAgent.postInit` wrote to the shared `process.env` (the next
+ * session's postInit overwrites them), and any the login shell exported (`ANTHROPIC_AUTH_TOKEN`,
+ * a cloud provider or gateway switch), which the CLI prefers over the connection's own key or token.
+ * The provider switches are every `CLAUDE_CODE_USE_*` flag the bundled CLI checks before using
+ * the first-party API (claude-subprocess-env.test.ts compares them with the binary); its other
+ * `CLAUDE_CODE_USE_*` flags turn on features, so this list is explicit rather than a prefix.
+ */
+export const CLAUDE_AUTH_ENV_KEYS = [
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_UNIX_SOCKET',
+    'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR',
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+    'CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
+    'CLAUDE_CODE_OAUTH_SCOPES',
+    'CLAUDE_CODE_SESSION_ACCESS_TOKEN',
+    'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST',
+    'CLAUDE_CODE_HOST_AUTH_ENV_VAR',
+    'CLAUDE_CODE_USE_BEDROCK',
+    'CLAUDE_CODE_USE_VERTEX',
+    'CLAUDE_CODE_USE_FOUNDRY',
+    'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+    'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
+    'CLAUDE_CODE_USE_MANTLE',
+    'CLAUDE_CODE_USE_GATEWAY',
+] as const;
+
+/**
  * Get default SDK options for spawning the Claude Code subprocess.
  *
  * @param envOverrides - Per-session environment variable overrides.
  *   These are spread AFTER process.env so they take precedence.
  *   Used to pass per-session config like ANTHROPIC_BASE_URL that would
  *   otherwise be clobbered by concurrent sessions mutating process.env.
+ * @param connectionEnv - The session's own connection variables (`resolveAuthEnvVars`). When
+ *   given, they replace every {@link CLAUDE_AUTH_ENV_KEYS} variable, so the CLI never starts
+ *   with another session's credentials or endpoint left in process.env, or the shell's.
  */
 export function buildClaudeSubprocessEnv(
     envOverrides?: Record<string, string>,
+    connectionEnv?: Record<string, string>,
 ): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {
         ...process.env,
@@ -192,6 +228,45 @@ export function buildClaudeSubprocessEnv(
         // Propagate debug mode from argv flag OR existing env var
         CRAFT_DEBUG: (process.argv.includes('--debug') || process.env.CRAFT_DEBUG === '1') ? '1' : '0',
     };
+    if (connectionEnv) {
+        for (const key of CLAUDE_AUTH_ENV_KEYS) delete env[key];
+        Object.assign(env, connectionEnv);
+    }
+
+    // SDK 0.3.268 (Claude Code 2.1.268) stopped offering the task-tracking tools
+    // (TodoWrite and the Task* family) by default on Opus ≤4.7, Sonnet ≤4.6 and
+    // Haiku 4.5. Craft renders TodoWrite in the transcript regardless of model, so
+    // keep the tools available everywhere. No-op on models that still get them.
+    if (env.CLAUDE_CODE_ENABLE_TODO_TOOLS === undefined) {
+        env.CLAUDE_CODE_ENABLE_TODO_TOOLS = '1';
+    }
+
+    // Claude Code 2.1.304 turned tool search on behind a custom ANTHROPIC_BASE_URL: every MCP tool
+    // (the session and source tools) goes behind ToolSearch, and the model loads their schemas through
+    // `tool_reference` blocks. A gateway that refuses that costs three refused requests per CLI process
+    // before it retries without (measured on 2.1.316); one that passes the fields on without supporting
+    // them may never give the model those tools. Keep it off there, as before. An explicit value wins.
+    if (env.ENABLE_TOOL_SEARCH === undefined && isThirdPartyBaseUrl(env.ANTHROPIC_BASE_URL)) {
+        env.ENABLE_TOOL_SEARCH = 'false';
+    }
+
+    // When the model's safeguards keep stopping a reply, Claude Code answers it again on a fallback
+    // model and keeps the session on it. Behind a third-party endpoint that model is
+    // `ANTHROPIC_DEFAULT_OPUS_MODEL` or else `claude-opus-4-8` (Claude Code 2.1.316), whatever the
+    // connection's own model is called, and the endpoint may not serve it: every turn after the switch
+    // would fail. There the refusal ends the turn with its explanation instead. An explicit value wins.
+    if (env.CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK === undefined && isThirdPartyBaseUrl(env.ANTHROPIC_BASE_URL)) {
+        env.CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK = '1';
+    }
+
+    // Windows: point the SDK's Bash tool at the user-configured Git Bash if set.
+    // The SDK otherwise falls back to a hardcoded Program Files search that misses
+    // per-user installs (e.g. AppData\Local\Programs\Git) → "No bash shell found"
+    // (#935). Only fill when unset so a live-validated value (startup/CHECK) wins.
+    if (process.platform === 'win32' && !env.CLAUDE_CODE_GIT_BASH_PATH) {
+        const gitBash = getGitBashPath()?.trim();
+        if (gitBash) env.CLAUDE_CODE_GIT_BASH_PATH = gitBash;
+    }
 
     // Bedrock must never be routed through the Claude SDK path.
     // Strip only Claude-specific Bedrock routing vars here; keep generic AWS_*
@@ -203,16 +278,27 @@ export function buildClaudeSubprocessEnv(
     return env;
 }
 
+/** A base URL that is not Anthropic's own API (an Anthropic-compatible gateway or local runtime). */
+function isThirdPartyBaseUrl(baseUrl: string | undefined): boolean {
+    if (!baseUrl?.trim()) return false;
+    try {
+        const host = new URL(baseUrl.trim()).hostname.toLowerCase();
+        return host !== 'anthropic.com' && !host.endsWith('.anthropic.com');
+    } catch {
+        return true;
+    }
+}
+
 /** Filename of the per-platform native Claude binary inside its npm package. */
 function nativeBinaryName(): string {
     return process.platform === 'win32' ? 'claude.exe' : 'claude';
 }
 
-export function getDefaultOptions(envOverrides?: Record<string, string>): Partial<Options> {
+export function getDefaultOptions(envOverrides?: Record<string, string>, connectionEnv?: Record<string, string>): Partial<Options> {
     // Repair corrupted ~/.claude.json before the SDK subprocess reads it
     ensureClaudeConfig();
 
-    const env = buildClaudeSubprocessEnv(envOverrides);
+    const env = buildClaudeSubprocessEnv(envOverrides, connectionEnv);
 
     // If custom path is set (e.g., for Electron packaged build), point the SDK at it.
     // This is the native `claude` binary, not a JS file.
@@ -238,4 +324,26 @@ export function getDefaultOptions(envOverrides?: Record<string, string>): Partia
     // (e.g. `@anthropic-ai/claude-agent-sdk-darwin-arm64`) is installed via
     // optionalDependencies.
     return { env };
+}
+
+/**
+ * Options for tool-less text completions (titles, summaries, `call_llm`,
+ * connection and URL validation probes).
+ *
+ * - `tools: []` drops every built-in tool. Omitting `tools` hands these
+ *   one-shot queries the full Claude Code tool set (Bash, Write, Edit, …),
+ *   which costs input tokens on every call. `outputFormat` keeps working: the
+ *   SDK still registers its `StructuredOutput` tool (verified on 0.3.302). Since
+ *   0.3.302 a refused response is an error result with no `structured_output`
+ *   (`consumeLlmQueryMessages` reports it as a warning).
+ * - `permissionMode: 'default'` pins the mode. Since SDK 0.3.286 an omitted
+ *   mode is no longer forced to `'default'`; Claude Code picks the user's
+ *   `permissions.defaultMode` from the settings it loads, else `'auto'`.
+ */
+export function getTextCompletionOptions(envOverrides?: Record<string, string>, connectionEnv?: Record<string, string>): Partial<Options> {
+    return {
+        ...getDefaultOptions(envOverrides, connectionEnv),
+        tools: [],
+        permissionMode: 'default',
+    };
 }

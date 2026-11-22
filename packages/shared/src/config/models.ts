@@ -14,34 +14,98 @@
 // Must stay in sync with BEDROCK_MODEL_MAP in llm-connections.ts.
 const BEDROCK_TO_BARE: Record<string, string> = {
   // US inference profile IDs (primary)
+  'us.anthropic.claude-opus-5-5': 'claude-opus-5-5',
+  'us.anthropic.claude-opus-5': 'claude-opus-5',
+  'us.anthropic.claude-opus-4-8': 'claude-opus-4-8',
+  'us.anthropic.claude-fable-5-2': 'claude-fable-5-2',
+  'us.anthropic.claude-fable-5-1': 'claude-fable-5-1',
+  'us.anthropic.claude-fable-5': 'claude-fable-5',
+  'us.anthropic.claude-opus-4-7': 'claude-opus-4-7',
+  // Compatibility alias for an earlier incorrect 4.7 mapping.
   'us.anthropic.claude-opus-4-7-v1': 'claude-opus-4-7',
+  'us.anthropic.claude-sonnet-5-5': 'claude-sonnet-5-5',
+  'us.anthropic.claude-sonnet-5': 'claude-sonnet-5',
+  'us.anthropic.claude-haiku-5-5': 'claude-haiku-5-5',
   'us.anthropic.claude-sonnet-4-6': 'claude-sonnet-4-6',
   'us.anthropic.claude-haiku-4-5-20251001-v1:0': 'claude-haiku-4-5-20251001',
   'us.anthropic.claude-opus-4-6-v1': 'claude-opus-4-6',
   'us.anthropic.claude-opus-4-5-20251101-v1:0': 'claude-opus-4-5-20251101',
   'us.anthropic.claude-sonnet-4-5-20250929-v1:0': 'claude-sonnet-4-5-20250929',
   // EU inference profile IDs
+  'eu.anthropic.claude-opus-5-5': 'claude-opus-5-5',
+  'eu.anthropic.claude-opus-5': 'claude-opus-5',
+  'eu.anthropic.claude-opus-4-8': 'claude-opus-4-8',
+  'eu.anthropic.claude-fable-5-2': 'claude-fable-5-2',
+  'eu.anthropic.claude-fable-5-1': 'claude-fable-5-1',
+  'eu.anthropic.claude-fable-5': 'claude-fable-5',
+  'eu.anthropic.claude-opus-4-7': 'claude-opus-4-7',
   'eu.anthropic.claude-opus-4-7-v1': 'claude-opus-4-7',
+  'eu.anthropic.claude-sonnet-5-5': 'claude-sonnet-5-5',
+  'eu.anthropic.claude-sonnet-5': 'claude-sonnet-5',
+  'eu.anthropic.claude-haiku-5-5': 'claude-haiku-5-5',
   'eu.anthropic.claude-sonnet-4-6': 'claude-sonnet-4-6',
   'eu.anthropic.claude-haiku-4-5-20251001-v1:0': 'claude-haiku-4-5-20251001',
   'eu.anthropic.claude-opus-4-6-v1': 'claude-opus-4-6',
   'eu.anthropic.claude-opus-4-5-20251101-v1:0': 'claude-opus-4-5-20251101',
   'eu.anthropic.claude-sonnet-4-5-20250929-v1:0': 'claude-sonnet-4-5-20250929',
   // Global inference profile IDs
+  'global.anthropic.claude-opus-5-5': 'claude-opus-5-5',
+  'global.anthropic.claude-opus-5': 'claude-opus-5',
+  'global.anthropic.claude-opus-4-8': 'claude-opus-4-8',
+  'global.anthropic.claude-fable-5-2': 'claude-fable-5-2',
+  'global.anthropic.claude-fable-5-1': 'claude-fable-5-1',
+  'global.anthropic.claude-fable-5': 'claude-fable-5',
+  'global.anthropic.claude-opus-4-7': 'claude-opus-4-7',
   'global.anthropic.claude-opus-4-7-v1': 'claude-opus-4-7',
+  'global.anthropic.claude-sonnet-5-5': 'claude-sonnet-5-5',
+  'global.anthropic.claude-sonnet-5': 'claude-sonnet-5',
+  'global.anthropic.claude-haiku-5-5': 'claude-haiku-5-5',
   'global.anthropic.claude-sonnet-4-6': 'claude-sonnet-4-6',
   'global.anthropic.claude-haiku-4-5-20251001-v1:0': 'claude-haiku-4-5-20251001',
   'global.anthropic.claude-opus-4-6-v1': 'claude-opus-4-6',
   // Base IDs (no region prefix)
+  'anthropic.claude-opus-5-5': 'claude-opus-5-5',
+  'anthropic.claude-opus-5': 'claude-opus-5',
+  'anthropic.claude-opus-4-8': 'claude-opus-4-8',
+  'anthropic.claude-fable-5-2': 'claude-fable-5-2',
+  'anthropic.claude-fable-5-1': 'claude-fable-5-1',
+  'anthropic.claude-fable-5': 'claude-fable-5',
+  'anthropic.claude-opus-4-7': 'claude-opus-4-7',
   'anthropic.claude-opus-4-7-v1': 'claude-opus-4-7',
+  'anthropic.claude-sonnet-5-5': 'claude-sonnet-5-5',
+  'anthropic.claude-sonnet-5': 'claude-sonnet-5',
+  'anthropic.claude-haiku-5-5': 'claude-haiku-5-5',
   'anthropic.claude-sonnet-4-6': 'claude-sonnet-4-6',
   'anthropic.claude-haiku-4-5-20251001-v1:0': 'claude-haiku-4-5-20251001',
   'anthropic.claude-opus-4-6-v1': 'claude-opus-4-6',
   'anthropic.claude-opus-4-5-20251101-v1:0': 'claude-opus-4-5-20251101',
   'anthropic.claude-sonnet-4-5-20250929-v1:0': 'claude-sonnet-4-5-20250929',
 };
-function bedrockToBarId(modelId: string): string {
+function bedrockToBareId(modelId: string): string {
   return BEDROCK_TO_BARE[modelId] ?? modelId;
+}
+
+const DEPRECATED_MODEL_REPLACEMENTS: Record<string, string> = {
+  'claude-opus-4-5-20251101': 'claude-opus-4-8',
+  'anthropic.claude-opus-4-5-20251101-v1:0': 'anthropic.claude-opus-4-8',
+  'anthropic.claude-opus-4-7-v1': 'anthropic.claude-opus-4-7',
+  'us.anthropic.claude-opus-4-5-20251101-v1:0': 'us.anthropic.claude-opus-4-8',
+  'us.anthropic.claude-opus-4-7-v1': 'us.anthropic.claude-opus-4-7',
+  'eu.anthropic.claude-opus-4-5-20251101-v1:0': 'eu.anthropic.claude-opus-4-8',
+  'eu.anthropic.claude-opus-4-7-v1': 'eu.anthropic.claude-opus-4-7',
+  'global.anthropic.claude-opus-4-7-v1': 'global.anthropic.claude-opus-4-7',
+  // DeepSeek retired the v4 Flash aliases; pi 0.86+ catalogs only list `deepseek-flash`.
+  'deepseek-v4-flash': 'deepseek-flash',
+  'deepseek-v4-flash-vision-exp': 'deepseek-flash',
+};
+
+/** Normalize deprecated built-in model IDs to the current supported replacement. */
+export function normalizeDeprecatedModelId(modelId: string): string {
+  if (modelId.startsWith('pi/')) {
+    const normalized = normalizeDeprecatedModelId(modelId.slice(3));
+    return normalized === modelId.slice(3) ? modelId : `pi/${normalized}`;
+  }
+  return DEPRECATED_MODEL_REPLACEMENTS[modelId] ?? modelId;
 }
 
 // ============================================
@@ -77,6 +141,12 @@ export interface ModelDefinition {
   supportsThinking?: boolean;
   /** Explicit per-model image input capability hint, primarily for custom endpoints. */
   supportsImages?: boolean;
+  /**
+   * Adaptive thinking is always on and the Messages API rejects
+   * `thinking: { type: 'disabled' }` (Fable/Mythos, the 5.5 family). Thinking depth is
+   * steered with `effort` only; see isAdaptiveThinkingAlwaysOnModel().
+   */
+  thinkingAlwaysOn?: boolean;
 }
 
 // ============================================
@@ -92,24 +162,56 @@ export const MODEL_REGISTRY: ModelDefinition[] = [
   // Anthropic Claude Models
   // ----------------------------------------
   {
-    id: 'claude-opus-4-7',
-    name: 'Opus 4.7',
+    id: 'claude-opus-5-5',
+    name: 'Opus 5.5',
+    // First 'Opus' entry: findModelIdByShortName('Opus') resolves to it, which
+    // makes it DEFAULT_MODEL for new Anthropic connections. Existing connections
+    // keep their pinned model - nothing migrates to 5.5.
     shortName: 'Opus',
     description: 'Most capable for complex work',
     descriptionKey: 'model.opusDesc',
     provider: 'anthropic',
     contextWindow: 1_000_000,
+    // The API returns 400 for `thinking: { type: 'disabled' }` on Opus 5.5.
+    thinkingAlwaysOn: true,
+  },
+  {
+    id: 'claude-opus-5',
+    name: 'Opus 5',
+    shortName: 'Opus',
+    description: 'Previous Opus generation',
+    descriptionKey: 'model.opusDesc',
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'claude-opus-4-8',
+    name: 'Opus 4.8',
+    shortName: 'Opus',
+    description: 'Previous Opus generation',
+    descriptionKey: 'model.opusDesc',
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'claude-opus-4-7',
+    name: 'Opus 4.7',
+    shortName: 'Opus',
+    description: 'Previous Opus generation',
+    descriptionKey: 'model.opusDesc',
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
   },
   // TODO(opus-4.6-sunset): remove this entry when Opus 4.6 is deprecated by
-  // Anthropic or we stop offering it. Also drop the related 4.6 pieces in
-  // llm-connections.ts PI_PREFERRED_DEFAULTS and the restoreOpus46ToAnthropicConnections
+  // Anthropic. Also drop the related 4.6 pieces in llm-connections.ts
+  // PI_PREFERRED_DEFAULTS and the restoreOpus46ToAnthropicConnections
   // migration in storage.ts (grep for TODO(opus-4.6-sunset) to find them all).
   {
     id: 'claude-opus-4-6',
     name: 'Opus 4.6',
-    // shortName intentionally collides with 4.7. 4.7 is listed first, so
-    // findModelIdByShortName('Opus') keeps returning 4.7 — zero behavior
-    // change for callers that reference "Opus" abstractly.
+    // shortName intentionally collides with the newer Opus entries. Those are
+    // listed first, so findModelIdByShortName('Opus') keeps returning the
+    // current default for callers that reference "Opus" abstractly.
     shortName: 'Opus',
     description: 'Previous Opus release',
     descriptionKey: 'model.opusDesc',
@@ -117,28 +219,93 @@ export const MODEL_REGISTRY: ModelDefinition[] = [
     contextWindow: 200_000,
   },
   {
+    id: 'claude-sonnet-5-5',
+    name: 'Sonnet 5.5',
+    // First 'Sonnet' entry: findModelIdByShortName('Sonnet') resolves to it.
+    shortName: 'Sonnet',
+    description: 'Best combination of speed and intelligence',
+    descriptionKey: 'model.sonnetDesc',
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+    // The 5.5 family is adaptive-only (Pi catalog: no `off` level, forced adaptive).
+    thinkingAlwaysOn: true,
+  },
+  {
+    id: 'claude-sonnet-5',
+    name: 'Sonnet 5',
+    shortName: 'Sonnet',
+    description: 'Previous Sonnet generation',
+    descriptionKey: 'model.sonnetDesc',
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+  },
+  {
     id: 'claude-sonnet-4-6',
     name: 'Sonnet 4.6',
     shortName: 'Sonnet',
-    description: 'Best for everyday tasks',
+    description: 'Previous Sonnet generation',
     descriptionKey: 'model.sonnetDesc',
     provider: 'anthropic',
     contextWindow: 200_000,
   },
   {
-    id: 'claude-haiku-4-5-20251001',
-    name: 'Haiku 4.5',
+    id: 'claude-haiku-5-5',
+    name: 'Haiku 5.5',
+    // First 'Haiku' entry: getDefaultSummarizationModel() resolves to it.
     shortName: 'Haiku',
     description: 'Fastest for quick answers',
     descriptionKey: 'model.haikuDesc',
     provider: 'anthropic',
+    contextWindow: 1_000_000,
+    thinkingAlwaysOn: true,
+  },
+  {
+    id: 'claude-haiku-4-5-20251001',
+    name: 'Haiku 4.5',
+    shortName: 'Haiku',
+    description: 'Previous Haiku generation',
+    descriptionKey: 'model.haikuDesc',
+    provider: 'anthropic',
     contextWindow: 200_000,
+  },
+  {
+    id: 'claude-fable-5-2',
+    name: 'Fable 5.2',
+    // First 'Fable' entry: findModelIdByShortName('Fable') resolves to it.
+    shortName: 'Fable',
+    description: 'Next-generation model for complex work',
+    descriptionKey: 'model.fableDesc',
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+    thinkingAlwaysOn: true,
+  },
+  {
+    id: 'claude-fable-5-1',
+    name: 'Fable 5.1',
+    shortName: 'Fable',
+    description: 'Previous Fable generation',
+    descriptionKey: 'model.fableDesc',
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+    thinkingAlwaysOn: true,
+  },
+  {
+    id: 'claude-fable-5',
+    name: 'Fable 5',
+    // shortName intentionally collides with the newer Fables, which are listed
+    // first, so findModelIdByShortName('Fable') resolves to the newest Fable.
+    shortName: 'Fable',
+    description: 'Previous Fable generation',
+    descriptionKey: 'model.fableDesc',
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+    thinkingAlwaysOn: true,
   },
 
   // ----------------------------------------
   // Pi Models
   // No hardcoded entries — models are discovered dynamically:
-  //   - Pi: getModels(provider) from @mariozechner/pi-ai SDK
+  //   - Pi: getModels(provider) from @earendil-works/pi-ai SDK
   // See ModelRefreshService in apps/electron/src/main/model-fetchers/
   // ----------------------------------------
 ];
@@ -212,12 +379,13 @@ export function getDefaultSummarizationModel(): string {
 
 /**
  * Get a model by ID from the registry.
- * Also handles Bedrock-native IDs (e.g. "anthropic.claude-opus-4-7-v1")
+ * Also handles Bedrock-native IDs (e.g. "anthropic.claude-opus-4-8")
  * by reverse-mapping to the bare Anthropic ID for lookup.
  */
 export function getModelById(modelId: string): ModelDefinition | undefined {
-  return MODEL_REGISTRY.find(m => m.id === modelId)
-    ?? MODEL_REGISTRY.find(m => m.id === bedrockToBarId(modelId));
+  const normalized = normalizeDeprecatedModelId(modelId);
+  return MODEL_REGISTRY.find(m => m.id === normalized)
+    ?? MODEL_REGISTRY.find(m => m.id === bedrockToBareId(normalized));
 }
 
 /**
@@ -226,9 +394,9 @@ export function getModelById(modelId: string): ModelDefinition | undefined {
 export function getModelDisplayName(modelId: string): string {
   const model = getModelById(modelId);
   if (model) return model.name;
-  // Fallback: normalize Bedrock-native IDs, then strip prefix and date suffix
-  // e.g., "claude-opus-4-5-20251101" → "Opus 4.5"
-  const normalized = bedrockToBarId(modelId);
+  // Fallback: normalize deprecated/Bedrock-native IDs, then strip prefix and date suffix
+  // e.g., "claude-opus-4-5-20251101" → "Opus 4.8"
+  const normalized = bedrockToBareId(normalizeDeprecatedModelId(modelId));
   const stripped = normalized
     .replace('claude-', '')
     .replace(/-\d{8}$/, '');  // Remove date suffix
@@ -251,8 +419,8 @@ export function getModelShortName(modelId: string): string {
   if (modelId.includes('/')) {
     return modelId.split('/').pop() || modelId;
   }
-  // Fallback: normalize Bedrock-native IDs, then humanize (same logic as getModelDisplayName)
-  const normalized = bedrockToBarId(modelId);
+  // Fallback: normalize deprecated/Bedrock-native IDs, then humanize (same logic as getModelDisplayName)
+  const normalized = bedrockToBareId(normalizeDeprecatedModelId(modelId));
   const stripped = normalized.replace('claude-', '').replace(/-\d{8}$/, '');
   const parts = stripped.split('-');
   const first = parts[0];
@@ -280,11 +448,33 @@ export function isOpusModel(modelId: string): boolean {
  * Check if a model ID refers to a Claude model.
  * Handles direct Anthropic IDs (e.g. "claude-sonnet-4-6"),
  * provider-prefixed IDs (e.g. "anthropic/claude-sonnet-4" via OpenRouter),
- * and Bedrock-native IDs (e.g. "anthropic.claude-opus-4-7-v1").
+ * and Bedrock-native IDs (e.g. "anthropic.claude-opus-4-8").
  */
 export function isClaudeModel(modelId: string): boolean {
   const lower = modelId.toLowerCase();
   return lower.startsWith('claude-') || lower.includes('/claude') || lower.includes('.claude');
+}
+
+/**
+ * Models where adaptive thinking is ALWAYS ON and `thinking: { type: 'disabled' }`
+ * is rejected by the Messages API (Claude Fable 5 / 5.1 / 5.2, Mythos, the 5.5 family).
+ * Callers must use adaptive thinking + the `effort` parameter to control depth on
+ * these models — there is no way to turn thinking off. Opus 5 and earlier,
+ * Sonnet and Haiku still accept `disabled`.
+ *
+ * Source of truth is the registry flag `thinkingAlwaysOn`, resolved for bare,
+ * pi/-prefixed and Bedrock-native id forms (mapped or region-prefixed). A pattern
+ * fallback covers ids that are not registered: the Fable/Mythos family (e.g.
+ * limited-availability Mythos snapshots) and any other Opus/Sonnet/Haiku 5.5 variant, such as
+ * a dated snapshot listed by /v1/models or a provider-prefixed id — the whole 5.5
+ * family rejects `disabled`, so erring towards adaptive + low is always safe.
+ */
+export function isAdaptiveThinkingAlwaysOnModel(modelId: string): boolean {
+  const bare = modelId.startsWith('pi/') ? modelId.slice(3) : modelId;
+  const known = getModelById(bare)
+    ?? MODEL_REGISTRY.find(m => m.thinkingAlwaysOn && bare.endsWith(`.${m.id}`));
+  if (known?.thinkingAlwaysOn !== undefined) return known.thinkingAlwaysOn;
+  return /claude-(fable|mythos)|claude-(opus|sonnet|haiku)-5-5\b/i.test(modelId);
 }
 
 

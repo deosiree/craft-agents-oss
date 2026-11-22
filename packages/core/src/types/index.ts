@@ -13,6 +13,8 @@ export type {
   StoredConfig,
 } from './workspace.ts';
 
+export type { ContextUsageSnapshot } from './context-usage.ts';
+
 // Session types
 export type {
   Session,
@@ -46,13 +48,14 @@ export type {
   ErrorCode,
   TypedError,
   PermissionRequest,
+  PermissionRisk,
   AgentEvent,
   // Auth-related types
   CredentialInputMode,
   AuthRequestType,
   AuthStatus,
 } from './message.ts';
-export { generateMessageId } from './message.ts';
+export { generateMessageId, withoutRetractedMessages } from './message.ts';
 
 // Message persistence mappers
 export { messageToStored, storedToMessage } from './message-mapper.ts';
@@ -64,4 +67,25 @@ export type {
   SessionProcessingStatus,
   ActiveSessionInfo,
 } from './server.ts';
+
+// Page types (workspace-scoped mini dashboards)
+export type {
+  PageKind,
+  PageScriptRuntime,
+  PageRefreshSpec,
+  PageRefreshStatus,
+  PageSeriesPoint,
+  PageDataSnapshot,
+  PageActionHttpMethod,
+  PageActionDescriptor,
+  PageActionGrant,
+  PageRenderLease,
+  PageActionInvocation,
+  PageActionRequest,
+  PageActionResult,
+  PageShareInfo,
+  PageClaudeArtifactInfo,
+  PageThumbnailInfo,
+  PageConfig,
+} from './page.ts';
 

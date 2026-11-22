@@ -236,6 +236,8 @@ export const REMOTE_ELIGIBLE_CHANNELS = new Set<string>([
   RPC_CHANNELS.sessions.SEND_MESSAGE,
   RPC_CHANNELS.sessions.CANCEL,
   RPC_CHANNELS.sessions.KILL_SHELL,
+  RPC_CHANNELS.sessions.GET_BACKGROUND_TASK_OUTPUT,
+  RPC_CHANNELS.sessions.STOP_BACKGROUND_TASK,
   RPC_CHANNELS.sessions.RESPOND_TO_PERMISSION,
   RPC_CHANNELS.sessions.RESPOND_TO_CREDENTIAL,
   RPC_CHANNELS.sessions.COMMAND,
@@ -262,8 +264,18 @@ export const REMOTE_ELIGIBLE_CHANNELS = new Set<string>([
   RPC_CHANNELS.transfer.COMMIT,
   RPC_CHANNELS.transfer.ABORT,
 
-  // tasks — workspace content
-  RPC_CHANNELS.tasks.GET_OUTPUT,
+  // tasks — workspace content (Conductor DAG runs on the workspace server)
+  RPC_CHANNELS.tasks.VALIDATE,
+  RPC_CHANNELS.tasks.CREATE,
+  RPC_CHANNELS.tasks.GENERATE,
+  RPC_CHANNELS.tasks.GENERATED,
+  RPC_CHANNELS.tasks.RUN,
+  RPC_CHANNELS.tasks.PAUSE,
+  RPC_CHANNELS.tasks.RESUME,
+  RPC_CHANNELS.tasks.STOP,
+  RPC_CHANNELS.tasks.GET,
+  RPC_CHANNELS.tasks.LIST,
+  RPC_CHANNELS.tasks.GET_RESULTS,
 
   // file — workspace files (not openDialog which is native)
   RPC_CHANNELS.file.READ,
@@ -321,6 +333,21 @@ export const REMOTE_ELIGIBLE_CHANNELS = new Set<string>([
   RPC_CHANNELS.settings.TEST_LLM_CONNECTION_SETUP,
   RPC_CHANNELS.settings.GET_DEFAULT_THINKING_LEVEL,
   RPC_CHANNELS.settings.SET_DEFAULT_THINKING_LEVEL,
+  RPC_CHANNELS.settings.GET_AUTO_COMPACT_WINDOW,
+  RPC_CHANNELS.settings.SET_AUTO_COMPACT_WINDOW,
+  RPC_CHANNELS.settings.GET_SUBAGENT_MODEL,
+  RPC_CHANNELS.settings.SET_SUBAGENT_MODEL,
+
+  // decisions — the decision layer's settings and keys live on the server whose sessions ask the
+  // model (it can reuse that server's LLM connections); the Laya probe tests what that server reaches
+  RPC_CHANNELS.decisions.GET_SETTINGS,
+  RPC_CHANNELS.decisions.SET_SETTINGS,
+  RPC_CHANNELS.decisions.GET_STATUS,
+  RPC_CHANNELS.decisions.SET_API_KEY,
+  RPC_CHANNELS.decisions.DELETE_API_KEY,
+  RPC_CHANNELS.decisions.TEST,
+  RPC_CHANNELS.decisions.PROBE_SERVER,
+  RPC_CHANNELS.decisions.GET_USAGE,
 
   // pi — provider config on workspace server
   RPC_CHANNELS.pi.GET_API_KEY_PROVIDERS,
@@ -351,6 +378,7 @@ export const REMOTE_ELIGIBLE_CHANNELS = new Set<string>([
   RPC_CHANNELS.oauth.START,
   RPC_CHANNELS.oauth.COMPLETE,
   RPC_CHANNELS.oauth.CANCEL,
+  RPC_CHANNELS.oauth.STATUS,
   RPC_CHANNELS.oauth.REVOKE,
 
   // workspace — workspace config + images (sharp on headless)
@@ -402,8 +430,63 @@ export const REMOTE_ELIGIBLE_CHANNELS = new Set<string>([
   RPC_CHANNELS.automations.REPLAY,
   RPC_CHANNELS.automations.CHANGED,
 
+  // projects — workspace projects
+  RPC_CHANNELS.projects.GET,
+  RPC_CHANNELS.projects.GET_ONE,
+  RPC_CHANNELS.projects.CREATE,
+  RPC_CHANNELS.projects.UPDATE,
+  RPC_CHANNELS.projects.DELETE,
+  RPC_CHANNELS.projects.LIST_ASSETS,
+  RPC_CHANNELS.projects.UPLOAD_ASSET,
+  RPC_CHANNELS.projects.DELETE_ASSET,
+  RPC_CHANNELS.projects.CHANGED,
+
+  // pages — workspace pages (mini dashboards)
+  RPC_CHANNELS.pages.GET,
+  RPC_CHANNELS.pages.GET_ONE,
+  RPC_CHANNELS.pages.CREATE,
+  RPC_CHANNELS.pages.UPDATE,
+  RPC_CHANNELS.pages.DELETE,
+  RPC_CHANNELS.pages.GET_CONTENT,
+  RPC_CHANNELS.pages.SET_CONTENT,
+  RPC_CHANNELS.pages.GET_DATA,
+  RPC_CHANNELS.pages.LIST_GRANTS,
+  RPC_CHANNELS.pages.ISSUE_GRANT,
+  RPC_CHANNELS.pages.REVOKE_GRANT,
+  RPC_CHANNELS.pages.CREATE_LEASE,
+  RPC_CHANNELS.pages.RELEASE_LEASE,
+  RPC_CHANNELS.pages.EXECUTE_ACTION,
+  RPC_CHANNELS.pages.CANCEL_ACTION,
+  // Sharing runs on the workspace server: it holds the page files, the vault
+  // token, and evaluates the CRAFT_FEATURE_PAGES_SHARING flag.
+  RPC_CHANNELS.pages.GET_SHARE_CAPABILITIES,
+  RPC_CHANNELS.pages.GET_SHARE_DATA_SCAN,
+  RPC_CHANNELS.pages.PUBLISH,
+  RPC_CHANNELS.pages.SET_PUBLICATION_PASSWORD,
+  RPC_CHANNELS.pages.UNPUBLISH,
+  // claude.ai artifact: runs Claude Code where the page files and the Claude credential live.
+  RPC_CHANNELS.pages.PUBLISH_CLAUDE_ARTIFACT,
+  // Thumbnails: the poster file lives on the workspace server; regeneration is
+  // a no-op unless that host injected a capturer (Electron main).
+  RPC_CHANNELS.pages.GET_THUMBNAIL,
+  RPC_CHANNELS.pages.REGENERATE_THUMBNAIL,
+  RPC_CHANNELS.pages.CHANGED,
+
   // git — workspace filesystem
   RPC_CHANNELS.git.GET_BRANCH,
+  RPC_CHANNELS.git.LIST_REPOS,
+  RPC_CHANNELS.git.CREATE_WORKTREE,
+
+  // prWatch — the PR watcher runs where the session's repo, source credentials and `gh` live
+  RPC_CHANNELS.prWatch.SUBSCRIBE,
+  RPC_CHANNELS.prWatch.UNSUBSCRIBE,
+  RPC_CHANNELS.prWatch.REFRESH,
+  RPC_CHANNELS.prWatch.GET_DETAILS,
+  RPC_CHANNELS.prWatch.BIND,
+  RPC_CHANNELS.prWatch.UNBIND,
+  RPC_CHANNELS.prWatch.SET_AUTO_MERGE,
+  RPC_CHANNELS.prWatch.SET_AUTO_FIX,
+  RPC_CHANNELS.prWatch.CHANGED,
 
   // resources — workspace resource export/import
   RPC_CHANNELS.resources.EXPORT,

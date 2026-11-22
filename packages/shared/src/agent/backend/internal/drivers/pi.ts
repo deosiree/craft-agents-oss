@@ -22,14 +22,6 @@ const COPILOT_HEADERS = {
   'Copilot-Integration-Id': 'vscode-chat',
 } as const;
 
-/** Extract API base URL from a Copilot API token's proxy-ep field. */
-function getBaseUrlFromToken(token: string): string | null {
-  const match = token.match(/proxy-ep=([^;]+)/);
-  if (!match?.[1]) return null;
-  const apiHost = match[1].replace(/^proxy\./, 'api.');
-  return `https://${apiHost}`;
-}
-
 /**
  * Fetch models directly from the Copilot API via HTTP.
  *
@@ -43,10 +35,10 @@ async function listModelsViaHttp(
   githubToken: string,
   timeoutMs: number,
 ): Promise<RawCopilotModel[]> {
-  const { refreshGitHubCopilotToken } = await import('@mariozechner/pi-ai/oauth');
+  const { refreshGitHubCopilotToken, getBaseUrlFromToken } = await import('../../../../auth/github-copilot.ts');
 
   // Step 1: Exchange GitHub OAuth token → Copilot API token
-  const creds = await refreshGitHubCopilotToken(githubToken);
+  const creds = await refreshGitHubCopilotToken(githubToken, { timeoutMs });
   const copilotToken = creds.access;
 
   // Step 2: Extract base URL from token
@@ -286,7 +278,7 @@ export const piDriver: ProviderDriver = {
     let modelApi: string | undefined;
     let modelBaseUrl: string | undefined;
     try {
-      const { getModels } = await import('@mariozechner/pi-ai');
+      const { getModels } = await import('@earendil-works/pi-ai/compat');
       const models = getModels(piAuthProvider as Parameters<typeof getModels>[0]);
       const requestedId = args.model.startsWith('pi/') ? args.model.slice(3) : args.model;
       const match = models.find(m => m.id === requestedId) || models[0];

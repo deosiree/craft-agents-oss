@@ -41,6 +41,7 @@ export {
   saveSession,
   loadSession,
   listSessions,
+  listSessionsAsync,
   deleteSession,
   clearSessionMessages,
   getOrCreateLatestSession,
@@ -51,6 +52,9 @@ export {
   flagSession,
   unflagSession,
   setSessionStatus,
+  setSessionLabels,
+  setSessionProjectId,
+  unbindProjectFromSessions,
   // Pending plan execution (Accept & Compact flow)
   setPendingPlanExecution,
   markCompactionComplete,
@@ -85,6 +89,8 @@ export {
 // JSONL helpers (for direct access if needed)
 export {
   readSessionHeader,
+  readSessionHeaderAsync,
+  SESSION_HEADER_READ_TIMEOUT_MS,
   readSessionJsonl,
   writeSessionJsonl,
   createSessionHeader,

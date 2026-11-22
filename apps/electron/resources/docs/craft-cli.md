@@ -35,6 +35,7 @@ Manage workspace labels stored under `labels/`.
 - `craft-agent label reorder [--parent <id|root>] <ordered-id-1> <ordered-id-2> ...`
 - `craft-agent label auto-rule-list <id>`
 - `craft-agent label auto-rule-add <id> --pattern "<regex>" [--flags "gi"] [--value-template "$1"] [--description "..."]`
+- `craft-agent label auto-rule-add <id> --semantic "<yes/no question>" [--threshold 0.9] [--value "..."] [--description "..."]` (semantic rule; needs the decision model enabled in Settings > AI)
 - `craft-agent label auto-rule-remove <id> --index <n>`
 - `craft-agent label auto-rule-clear <id>`
 - `craft-agent label auto-rule-validate <id>`
@@ -69,7 +70,7 @@ craft-agent label auto-rule-validate linear-issue
 Manage workspace sources stored under `sources/{slug}/`.
 
 ### Commands
-- `craft-agent source list [--include-builtins true|false]`
+- `craft-agent source list`
 - `craft-agent source get <slug>`
 - `craft-agent source create` (see flags below)
 - `craft-agent source update <slug> --json '{...}'`
@@ -203,7 +204,7 @@ Manage workspace automations stored in `automations.json`.
 
 | Flag | Description |
 |------|-------------|
-| `--event <EventName>` | **(required for create)** Event trigger (e.g., `UserPromptSubmit`, `SchedulerTick`, `LabelAdd`) |
+| `--event <EventName>` | **(required for create)** Event trigger (e.g., `SchedulerTick`, `LabelAdd`, `SessionStatusChange`; see automations.md for the full list) |
 | `--name "<name>"` | Display name for the automation |
 | `--matcher "<regex>"` | Regex pattern for event matching |
 | `--cron "<expression>"` | Cron expression (for `SchedulerTick` events) |
@@ -215,13 +216,15 @@ Manage workspace automations stored in `automations.json`.
 | `--llm-connection "<slug>"` | LLM connection slug for the created session |
 | `--model "<model-id>"` | Model ID for the created session |
 
+Fields without a flag of their own — `conditions`, `semanticCondition` (decision-model yes/no gate) and `telegramTopic` — go in `--json`; the whole config is validated before it is written.
+
 ### Examples
 
 ```bash
 craft-agent automation list
 craft-agent automation validate
 # Simple prompt automation with flat flags
-craft-agent automation create --event UserPromptSubmit --prompt "Summarize this prompt"
+craft-agent automation create --event LabelAdd --matcher "^urgent$" --prompt "Review this urgent session and summarise the issue"
 # Scheduled automation with flat flags
 craft-agent automation create --event SchedulerTick --cron "0 9 * * 1-5" --timezone "Europe/Budapest" --prompt "Give me a morning briefing" --labels "Scheduled" --permission-mode safe
 # Complex automation with --json
@@ -232,7 +235,7 @@ craft-agent automation enable abc123
 craft-agent automation duplicate abc123
 craft-agent automation history abc123 --limit 10
 craft-agent automation last-executed abc123
-craft-agent automation test abc123 --match "UserPromptSubmit"
+craft-agent automation test abc123 --match "urgent"
 craft-agent automation lint
 craft-agent automation delete abc123
 ```

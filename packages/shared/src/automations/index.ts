@@ -4,7 +4,6 @@
  * Slim barrel file that re-exports from decomposed modules:
  * - types.ts: All type definitions
  * - validation.ts: Config validation functions
- * - sdk-bridge.ts: SDK environment variable building
  * - utils.ts: Shared utilities (toSnakeCase, expandEnvVars, etc.)
  * - automation-system.ts: AutomationSystem facade (main entry point)
  * - event-bus.ts: WorkspaceEventBus
@@ -24,22 +23,28 @@ export type {
   WebhookHttpMethod,
   WebhookBodyFormat,
   WebhookAuth,
+  ScriptAction,
+  ScriptActionRuntime,
   AutomationAction,
   AutomationMatcher,
   AutomationsConfig,
   PromptReferences,
   PromptActionResult,
   WebhookActionResult,
+  ScriptActionResult,
   ActionExecutionResult,
   PendingPrompt,
   AutomationResult,
   AutomationsValidationResult,
+  AutomationLoadIssue,
+  AutomationsLenientLoadResult,
   SdkAutomationInput,
   SdkAutomationCallback,
   SdkAutomationCallbackMatcher,
   SessionMetadataSnapshot,
   TimeCondition,
   StateCondition,
+  SemanticCondition,
   LogicalCondition,
   AutomationCondition,
 } from './types.ts';
@@ -52,21 +57,16 @@ export { APP_EVENTS, AGENT_EVENTS } from './types.ts';
 
 export {
   validateAutomationsConfig,
+  loadAutomationsConfigLenient,
   validateAutomationsContent,
   validateAutomations,
 } from './validation.ts';
 
 // ============================================================================
-// SDK Bridge
-// ============================================================================
-
-export { buildEnvFromSdkInput } from './sdk-bridge.ts';
-
-// ============================================================================
 // Utilities
 // ============================================================================
 
-export { parsePromptReferences } from './utils.ts';
+export { parsePromptReferences, buildScriptEnv, buildBaseScriptEnv, type ScriptEnvOptions } from './utils.ts';
 
 // ============================================================================
 // Re-exports from sub-modules
@@ -76,16 +76,23 @@ export { parsePromptReferences } from './utils.ts';
 export { AutomationEventLogger, type LoggedAutomationEvent, type LoggedAutomationEventInput } from './event-logger.ts';
 
 // Schemas
-export { AutomationsConfigSchema, AutomationConditionSchema, TimeConditionSchema, StateConditionSchema, zodErrorToIssues, VALID_EVENTS } from './schemas.ts';
+export { AutomationsConfigSchema, AutomationConditionSchema, TimeConditionSchema, StateConditionSchema, ScriptActionSchema, zodErrorToIssues, VALID_EVENTS } from './schemas.ts';
 
 // Condition evaluator
 export { evaluateConditions, type ConditionContext } from './conditions.ts';
 
-// Security utilities
-export { sanitizeForShell } from './security.ts';
-
 // Webhook execution utilities
 export { executeWebhookRequest, executeWithRetry, createWebhookHistoryEntry, createPromptHistoryEntry, type ExecuteWebhookOptions, type RetryConfig } from './webhook-utils.ts';
+
+// Script execution utilities
+export {
+  executeScriptAction,
+  createScriptHistoryEntry,
+  clampScriptTimeout,
+  DEFAULT_SCRIPT_TIMEOUT_MS,
+  MAX_SCRIPT_TIMEOUT_MS,
+  type ScriptExecutionContext,
+} from './script-executor.ts';
 
 // Retry scheduler
 export { RetryScheduler, type RetryQueueEntry, type RetrySchedulerOptions } from './retry-scheduler.ts';
@@ -131,9 +138,11 @@ export {
   PromptHandler,
   EventLogHandler,
   WebhookHandler,
+  ScriptHandler,
   type AutomationHandler,
   type PromptHandlerOptions,
   type EventLogHandlerOptions,
   type WebhookHandlerOptions,
+  type ScriptHandlerOptions,
   type AutomationsConfigProvider,
 } from './handlers/index.ts';

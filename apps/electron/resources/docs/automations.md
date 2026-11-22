@@ -11,6 +11,7 @@ This guide explains how to configure automations in Craft Agent to automate work
 Automations allow you to trigger actions automatically when specific events occur in Craft Agent. You can:
 - Send prompts to create agent sessions based on events
 - Send webhook HTTP requests to external services (Slack, Discord, custom APIs, etc.)
+- Run scripts from the workspace (Bun, Node or Python) with the event data in `CRAFT_*` environment variables
 - Execute actions on a schedule using cron expressions
 - Automate workflows based on permission mode changes, flags, or session status changes
 
@@ -27,7 +28,7 @@ Automations are configured in `automations.json` at the root of your workspace:
 ```bash
 craft-agent automation list
 craft-agent automation get <id>
-craft-agent automation create --event UserPromptSubmit --prompt "..."
+craft-agent automation create --event LabelAdd --matcher "^urgent$" --prompt "..."
 craft-agent automation update <id> --json '{...}'
 craft-agent automation enable <id>
 craft-agent automation disable <id>
@@ -64,8 +65,8 @@ craft-agent automation validate
 
 | Event | Trigger | Match Value |
 |-------|---------|-------------|
-| `LabelAdd` | Label added to session | Label ID (e.g., `bug`, not `Bug`) |
-| `LabelRemove` | Label removed from session | Label ID (e.g., `bug`, not `Bug`) |
+| `LabelAdd` | Label added to session | The label entry: the ID for a plain label (`bug`, not `Bug`), `id::value` for a valued one (`priority::3`; match it with `^priority(::|$)`) |
+| `LabelRemove` | Label removed from session | The label entry, as for `LabelAdd` |
 | `LabelConfigChange` | Label configuration changed | Always matches |
 | `PermissionModeChange` | Permission mode changed | New mode name |
 | `FlagChange` | Session flagged/unflagged | `true` or `false` |
@@ -74,23 +75,7 @@ craft-agent automation validate
 
 > **Note:** `TodoStateChange` is a deprecated alias for `SessionStatusChange`. Existing configs using the old name will continue to work but will show a deprecation warning during validation.
 
-### Agent Events (passed to Claude SDK)
-
-| Event | Trigger | Match Value |
-|-------|---------|-------------|
-| `PreToolUse` | Before a tool executes | Tool name |
-| `PostToolUse` | After a tool executes successfully | Tool name |
-| `PostToolUseFailure` | After a tool execution fails | Tool name |
-| `Notification` | Notification received | - |
-| `UserPromptSubmit` | User submits a prompt | - |
-| `SessionStart` | Session starts | - |
-| `SessionEnd` | Session ends | - |
-| `Stop` | Agent stops | - |
-| `SubagentStart` | Subagent spawned | - |
-| `SubagentStop` | Subagent completes | - |
-| `PreCompact` | Before context compaction | - |
-| `PermissionRequest` | Permission requested | - |
-| `Setup` | Initial setup | - |
+> **Only these events run actions.** Agent hook events such as `PreToolUse`, `PostToolUse`, `UserPromptSubmit` or `Stop` are not automation triggers: `automations.json` still accepts them, but no action ever runs for them. Do not create automations on them.
 
 ## Action Types
 
@@ -114,7 +99,7 @@ Send a prompt to Craft Agent (creates a new session for scheduled prompts).
 
 **Features:**
 - Use `@mentions` to reference sources or skills
-- Environment variables are expanded (e.g., `$CRAFT_LABEL`)
+- The event's `CRAFT_*` variables are expanded (e.g., `$CRAFT_LABEL`); no other environment variables, so `$HOME` or an API key expands to nothing
 
 **LLM Connection & Model:** Optionally specify which AI provider and model to use for the created session. If omitted, the workspace default connection and model are used.
 
@@ -211,9 +196,52 @@ The `auth` field is applied before custom `headers`, so you can override the gen
 
 **Security:** Webhook actions only have access to `CRAFT_*` system variables and `CRAFT_WH_*` user-defined secrets. They do **not** have access to your full system environment (e.g., `$HOME`, `$PATH`, or other process variables).
 
+### Script Actions
+
+Run a script that lives in the workspace. No session is created and no model is called, so script actions are the way to do deterministic work when an event fires: pull data, write a log, or call another program.
+
+```json
+{
+  "type": "script",
+  "script": "scripts/log-label.ts",
+  "args": ["--verbose"],
+  "runtime": "bun",
+  "timeoutMs": 60000
+}
+```
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `type` | `"script"` | Required | Action type |
+| `script` | string | Required | Script path relative to the workspace root. Absolute paths and paths that leave the workspace (also through symlinks) are rejected. |
+| `args` | string[] | `[]` | Extra arguments passed after the script path |
+| `runtime` | `"bun"` \| `"node"` \| `"python3"` | `"bun"` | Runtime the script runs under |
+| `timeoutMs` | number | `60000` | Per-run timeout, clamped to 1,000–900,000 ms (15 min). The script gets SIGTERM, then SIGKILL if it doesn't exit. |
+| `page` | string | - | Slug of the page this script refreshes: adds the `CRAFT_PAGE_*` variables and records the run on the page (see [pages.md](./pages.md)) |
+
+**How a script runs:**
+- It is spawned directly with its arguments, never through a shell, so `$(...)`, pipes and redirects are not interpreted.
+- The working directory is the workspace root.
+- The environment contains only `HOME` (on Windows, the basic system variables such as `USERPROFILE` and `TEMP`), the event's `CRAFT_*` variables (see [Environment Variables](#environment-variables)), `CRAFT_WORKSPACE_PATH`, and any `CRAFT_*` variables exported in your shell profile. There is **no `PATH`** and no credentials, so call other programs by absolute path (e.g. `/usr/bin/osascript`).
+- Runs of the same automation never overlap: if the previous run is still going, the new one is skipped and recorded as skipped in the history.
+- The exit code, stdout and stderr are recorded in the automation history (truncated).
+
+Example script (`scripts/log-label.ts`, run by Bun):
+
+```ts
+import { appendFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const session = process.env.CRAFT_SESSION_NAME ?? process.env.CRAFT_SESSION_ID;
+const line = `${new Date().toISOString()} ${process.env.CRAFT_EVENT} ${process.env.CRAFT_LABEL} (${session})\n`;
+appendFileSync(join(process.env.CRAFT_WORKSPACE_PATH!, 'label-log.txt'), line);
+```
+
+> **Page data on a schedule:** to refresh a Page's data, give the page a `refresh` spec (`refresh: { cron, script }`) instead of writing a `SchedulerTick` automation. See "Scheduled refresh" in [pages.md](./pages.md); it uses the same script runner.
+
 ## Environment Variables
 
-Both prompt and webhook actions support variable expansion using `$VAR` or `${VAR}` syntax.
+Prompt and webhook actions expand `$VAR` and `${VAR}` in their fields; a value is inserted as it is and never expanded again. Script actions receive the same variables as environment variables (`process.env.CRAFT_LABEL`, `os.environ["CRAFT_LABEL"]`, …).
 
 ### System Variables (CRAFT_*)
 
@@ -231,7 +259,7 @@ These are automatically set by the automation system based on the triggering eve
 
 | Event | Variable | Description |
 |-------|----------|-------------|
-| `LabelAdd` / `LabelRemove` | `$CRAFT_LABEL` | The label that was added/removed |
+| `LabelAdd` / `LabelRemove` | `$CRAFT_LABEL` | The label entry that was added/removed (`bug`, `priority::3`) |
 | `PermissionModeChange` | `$CRAFT_OLD_MODE`, `$CRAFT_NEW_MODE` | Previous and new permission mode |
 | `FlagChange` | `$CRAFT_IS_FLAGGED` | `true` or `false` |
 | `SessionStatusChange` | `$CRAFT_OLD_STATE`, `$CRAFT_NEW_STATE` | Previous and new status |
@@ -444,6 +472,33 @@ Combine conditions with `and`, `or`, and `not`:
 | `not` | None of the sub-conditions may pass |
 
 **Nesting depth:** Conditions can be nested up to 8 levels deep. A simplification warning is emitted at depth 4. Unknown condition types fail closed (evaluate to false).
+
+### Semantic Condition (requires the Decision Model)
+
+`conditions` can only compare fields. `semanticCondition` asks a yes/no question that the decision model (Jev, Settings > AI > Decision model, toggle "Automation conditions") answers before a prompt action starts a session:
+
+```json
+{
+  "matcher": "^needs-triage$",
+  "semanticCondition": {
+    "question": "Is the user reporting a bug or crash, rather than asking a question?",
+    "threshold": 0.6
+  },
+  "actions": [{ "type": "prompt", "prompt": "Triage the bug in session $CRAFT_SESSION_NAME" }]
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `question` | string | **Required.** The yes/no question, in English (max 500 characters). |
+| `threshold` | number | "Yes" probability needed to run, `0 < threshold <= 1`. Default `0.5`. |
+
+- The model sees the event (name, automation name, payload fields) and, for session events, the session's name, labels, status and its latest user and assistant messages (1,500 characters each).
+- Below the threshold the run is skipped and the automation history records it as skipped, not failed.
+- A matcher is judged once per event: all of its prompt actions run, or all are skipped.
+- **Inert without the decision model:** when it is off, unavailable or fails, the automation runs as it would without the condition.
+- **Loop guard:** an automation never runs for an event about a session it created itself (its own prompt matching a label rule would otherwise re-trigger it forever), and a chain of automation-created sessions triggering further automations stops at 3 sessions deep. Such runs are recorded as skipped.
+- It applies to prompt actions only; webhook and script actions are not gated.
 
 ## Permission Mode
 
@@ -787,8 +842,10 @@ A single automation can have both prompt and webhook actions. They execute in or
 
 Automations are validated when:
 1. The workspace is loaded
-2. You edit automations.json (via PreToolUse hook)
+2. You change automations with the `craft-agent automation` CLI (a direct Write/Edit of `automations.json` is redirected to the CLI, which validates before writing)
 3. You run `config_validate` with target `automations` or `all`
+
+**An invalid automation only stops itself.** When the file is loaded, each automation is checked on its own: one that fails (an unknown action type such as the removed `command`, a bad cron or regex, an unknown event) is skipped and the others keep running. The Automations screen marks it **Not running** and its page says why; agent-event automations get the same mark, because they never run. If `automations.json` isn't valid JSON, nothing new can load: the last loaded automations keep running and the screen shows the parse error.
 
 **Using config_validate:**
 
@@ -847,7 +904,7 @@ To protect against runaway automations (e.g., an automation that indirectly trig
 | Event | Max fires / minute |
 |-------|--------------------|
 | `SchedulerTick` | 60 (1/sec) |
-| All others (`LabelAdd`, `FlagChange`, `PreToolUse`, etc.) | 10 |
+| All other events (`LabelAdd`, `FlagChange`, etc.) | 10 |
 
 When a limit is hit, further events of that type are **silently dropped** for the remainder of the 60-second window. A warning is logged. The window resets automatically.
 
@@ -858,9 +915,17 @@ When a limit is hit, further events of that type are **silently dropped** for th
 ### Automation not firing
 
 1. **Check event name** - Must be exact (e.g., `LabelAdd` not `labeladd`)
-2. **Check matcher** - Regex must match the event value
-3. **Check cron** - For SchedulerTick, verify cron expression with an online tool
-4. **Check logs** - Look for `[automations]` or `[Scheduler]` in the logs
+2. **Check the event is supported** - Only the events under [Supported Events](#supported-events) run actions; hook events such as `PreToolUse` or `Stop` never do
+3. **Check matcher** - Regex must match the event value
+4. **Check cron** - For SchedulerTick, verify cron expression with an online tool
+5. **Check logs** - Look for `[automations]` or `[Scheduler]` in the logs
+
+### Script not running
+
+1. **Check the path** - `script` must be relative to the workspace root and stay inside it
+2. **Check the history** - The automation history shows the exit code, stdout and stderr of each run; a run marked skipped means the previous run was still going
+3. **Check programs it calls** - Scripts get no `PATH`; call other programs by absolute path
+4. **Check the timeout** - Long-running scripts are stopped after `timeoutMs` (default 60 s)
 
 ### Prompt not creating session
 

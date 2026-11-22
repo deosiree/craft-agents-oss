@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Markdown } from '../markdown'
+import { Markdown, type FileOpenHandler } from '../markdown'
 import type { AnnotationV1 } from '@craft-agent/core'
 import { type IslandTransitionConfig } from '../ui'
 import { AnnotationIslandMenu } from '../annotations/AnnotationIslandMenu'
@@ -53,7 +53,7 @@ export interface AnnotatableMarkdownDocumentProps {
   onRemoveAnnotation?: (messageId: string, annotationId: string) => void
   onUpdateAnnotation?: (messageId: string, annotationId: string, patch: Partial<AnnotationV1>) => void
   onOpenUrl?: (url: string) => void
-  onOpenFile?: (path: string) => void
+  onOpenFile?: FileOpenHandler
   sendMessageKey?: 'enter' | 'cmd-enter'
   islandZIndex?: React.CSSProperties['zIndex']
   openAnnotationRequest?: ExternalOpenAnnotationRequest | null
@@ -171,6 +171,17 @@ export function AnnotatableMarkdownDocument({
       return
     }
 
+    const computeGeometry = () => {
+      if (!renderedAnnotations.length) return { rects: [], chips: [] }
+      const geometry = computeAnnotationOverlayGeometry({
+        root,
+        renderedAnnotations,
+        persistedAnnotations: annotations,
+      })
+      return { rects: geometry.rects, chips: geometry.chips }
+    }
+
+    // Full recompute: rewrites block-marker DOM. Used for content/annotation changes.
     const recomputeOverlay = () => {
       clearBlockAnnotationMarkers(root)
 
@@ -179,24 +190,39 @@ export function AnnotatableMarkdownDocument({
         return
       }
 
-      const geometry = computeAnnotationOverlayGeometry({
-        root,
-        renderedAnnotations,
-        persistedAnnotations: annotations,
-      })
-
+      const next = computeGeometry()
       for (const annotation of renderedAnnotations) {
         applyBlockAnnotationMarker(root, annotation)
       }
+      setAnnotationOverlay(next)
+    }
 
-      setAnnotationOverlay({ rects: geometry.rects, chips: geometry.chips })
+    // Fast path: coordinates only, no DOM mutation. Used by scroll/resize.
+    const recomputeOverlayCoords = () => {
+      if (!renderedAnnotations.length) return
+      setAnnotationOverlay(computeGeometry())
+    }
+
+    let rafId: number | null = null
+    const scheduleCoordsRecompute = () => {
+      if (rafId != null) return
+      rafId = requestAnimationFrame(() => {
+        rafId = null
+        recomputeOverlayCoords()
+      })
     }
 
     recomputeOverlay()
-    window.addEventListener('resize', recomputeOverlay)
+    window.addEventListener('resize', scheduleCoordsRecompute)
+    // Capture-phase: scroll events don't bubble, but capture-phase listeners on
+    // ancestors fire for descendant scrolls — so this catches the overflow-auto
+    // viewport inside MarkdownDocBlock (and any future nested scroll surface).
+    root.addEventListener('scroll', scheduleCoordsRecompute, { capture: true, passive: true })
 
     return () => {
-      window.removeEventListener('resize', recomputeOverlay)
+      if (rafId != null) cancelAnimationFrame(rafId)
+      window.removeEventListener('resize', scheduleCoordsRecompute)
+      root.removeEventListener('scroll', scheduleCoordsRecompute, { capture: true } as EventListenerOptions)
     }
   }, [renderedAnnotations, annotations, content])
 

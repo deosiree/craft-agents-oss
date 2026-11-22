@@ -93,6 +93,136 @@ export function setupTestRequiresApiKey(baseUrl?: string): boolean {
   return !isLoopbackBaseUrl(baseUrl)
 }
 
+/** Placeholder run that stands in for a stored API key in the edit form (GET_API_KEY). */
+export const API_KEY_MASK = '••••••••'
+
+/**
+ * Mask a stored API key for display: provider prefix + mask + last four, or the
+ * mask alone for short keys. The only producer of masked values.
+ */
+export function maskApiKey(key: string): string {
+  return key.length > 15 ? key.slice(0, 7) + API_KEY_MASK + key.slice(-4) : API_KEY_MASK
+}
+
+/**
+ * True for values produced by {@link maskApiKey}, i.e. the edit form echoing a
+ * stored key back. Real keys never contain the bullet character.
+ */
+export function isMaskedApiKey(value: string | null | undefined): boolean {
+  return typeof value === 'string' && value.includes('••')
+}
+
+export type SetupTestApiKeyResolution =
+  | { ok: true; apiKey: string; source: 'input' | 'stored' }
+  | { ok: false; error: string }
+
+/**
+ * Decide which API key a setup test should use.
+ *
+ * The edit form shows the stored key as a masked placeholder; when the user
+ * leaves it untouched and clicks Test, the placeholder arrives here. Testing
+ * with the bullets always failed authentication (OSS #1048), so resolve it to
+ * the stored credential by connection slug, and ask for the key when that is
+ * not possible. Pure apart from the injected store lookup.
+ */
+export async function resolveSetupTestApiKey(
+  input: { apiKey: string | undefined; connectionSlug?: string; allowEmptyApiKey: boolean },
+  getStoredApiKey: (slug: string) => Promise<string | null>,
+): Promise<SetupTestApiKeyResolution> {
+  const trimmed = input.apiKey?.trim() ?? ''
+
+  if (isMaskedApiKey(trimmed)) {
+    if (!input.connectionSlug) {
+      return { ok: false, error: 'Re-enter the API key to test this connection.' }
+    }
+    const stored = await getStoredApiKey(input.connectionSlug)
+    if (!stored) {
+      return { ok: false, error: 'No API key is stored for this connection. Re-enter the key to test it.' }
+    }
+    return { ok: true, apiKey: stored, source: 'stored' }
+  }
+
+  if (!trimmed && !input.allowEmptyApiKey) {
+    return { ok: false, error: 'API key is required' }
+  }
+  return { ok: true, apiKey: trimmed, source: 'input' }
+}
+
+/**
+ * Store an OAuth access token sent with a connection setup.
+ *
+ * The Claude sign-in stores the token with its refresh token and expiry
+ * (`onboarding:exchangeClaudeCode`), then sends the same access token here.
+ * Replacing that entry with the bare token dropped the refresh token and the
+ * expiry, so the connection could not refresh once the token expired. A token
+ * the connection already holds is left as stored; returns whether it stored.
+ * Pure apart from the injected store.
+ */
+export async function storeSetupOAuthToken(
+  store: {
+    getLlmOAuth(slug: string): Promise<{ accessToken: string } | null>
+    setLlmOAuth(slug: string, credentials: { accessToken: string }): Promise<void>
+  },
+  slug: string,
+  accessToken: string,
+): Promise<boolean> {
+  if ((await store.getLlmOAuth(slug))?.accessToken === accessToken) return false
+  await store.setLlmOAuth(slug, { accessToken })
+  return true
+}
+
+/**
+ * Delete the credentials of a deleted connection. The legacy `claude_oauth` slot
+ * goes too when it was the default Claude sign-in: only the default connection
+ * reads the slot (`usesLegacyClaudeOAuthSlot`), so the connection that becomes
+ * the default would otherwise run on the deleted connection's account.
+ * Pure apart from the injected store.
+ */
+export async function deleteConnectionCredentials(
+  store: {
+    deleteLlmCredentials(slug: string): Promise<void>
+    delete(id: { type: 'claude_oauth' }): Promise<boolean>
+  },
+  connection: { slug: string; providerType: string; authType: string },
+  wasDefault: boolean,
+): Promise<void> {
+  await store.deleteLlmCredentials(connection.slug)
+  if (wasDefault && connection.providerType === 'anthropic' && connection.authType === 'oauth') {
+    await store.delete({ type: 'claude_oauth' })
+  }
+}
+
+/**
+ * The default moved away from a Claude sign-in connection: the legacy `claude_oauth`
+ * slot goes with it. Only the default connection reads the slot
+ * (`usesLegacyClaudeOAuthSlot`), so the new default would otherwise run on the
+ * previous one's account once no other connection has credentials of its own
+ * (e.g. after the previous default is deleted). A previous default that ran on the
+ * slot (`previousUsedSlot`, read before the switch) and has no entry of its own
+ * keeps those credentials in its own entry. Pure apart from the injected store.
+ */
+export async function releaseLegacyClaudeSlot(
+  store: {
+    getClaudeOAuthCredentials(): Promise<{ accessToken: string; refreshToken?: string; expiresAt?: number } | null>
+    getLlmOAuth(slug: string): Promise<{ accessToken: string } | null>
+    setLlmOAuth(slug: string, credentials: { accessToken: string; refreshToken?: string; expiresAt?: number }): Promise<void>
+    delete(id: { type: 'claude_oauth' }): Promise<boolean>
+  },
+  previousDefault: { slug: string; providerType: string; authType: string } | null,
+  previousUsedSlot: boolean,
+  newDefaultSlug: string,
+): Promise<void> {
+  if (!previousDefault || previousDefault.slug === newDefaultSlug) return
+  if (previousDefault.providerType !== 'anthropic' || previousDefault.authType !== 'oauth') return
+  const legacy = await store.getClaudeOAuthCredentials()
+  if (!legacy?.accessToken) return
+  if (previousUsedSlot && !(await store.getLlmOAuth(previousDefault.slug))?.accessToken) {
+    const { accessToken, refreshToken, expiresAt } = legacy
+    await store.setLlmOAuth(previousDefault.slug, { accessToken, refreshToken, expiresAt })
+  }
+  await store.delete({ type: 'claude_oauth' })
+}
+
 /**
  * Decide how a custom OpenAI/Anthropic-compatible endpoint should be persisted.
  *
@@ -178,6 +308,7 @@ const PI_AUTH_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   google: 'Google AI Studio',
   openrouter: 'OpenRouter',
   'azure-openai-responses': 'Azure OpenAI',
+  'cloudflare-ai-gateway': 'Cloudflare AI Gateway',
   'amazon-bedrock': 'Amazon Bedrock',
   groq: 'Groq',
   mistral: 'Mistral',

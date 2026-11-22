@@ -24,22 +24,27 @@ function createMockRegistry(
 }
 
 describe('pickProviderAppropriateMiniModel', () => {
-  it('returns undefined for anthropic so caller falls through to Haiku', () => {
-    // The caller gates this with `authProvider === 'anthropic' ? undefined : pick...`
-    // but we also guarantee the helper itself would return Opus-4-7 first — which is
-    // NOT what we want as a mini. Test that the caller's gate is sufficient by showing
-    // the helper would otherwise pick a non-mini candidate for anthropic.
+  it('anthropic: picks the utility tier (Haiku), never the flagship', () => {
     const registry = createMockRegistry({
       anthropic: [
+        { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
         { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
         { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5' },
       ],
     });
+    // PI_PREFERRED_MINI_MODELS.anthropic is tried before the best-first defaults.
+    expect(pickProviderAppropriateMiniModel('anthropic', registry, false)).toBe('claude-haiku-4-5');
+  });
 
-    const result = pickProviderAppropriateMiniModel('anthropic', registry, false);
-    // Helper picks first entry from PI_PREFERRED_DEFAULTS.anthropic which is claude-opus-4-7.
-    // Documenting why the caller must NOT invoke this helper for anthropic auth.
-    expect(result).toBe('claude-opus-4-7');
+  it('openai-codex: picks GPT-6 Luna before the best-first defaults (GPT-6 Astra)', () => {
+    const registry = createMockRegistry({
+      'openai-codex': [
+        { id: 'gpt-6-astra', name: 'GPT-6 Astra' },
+        { id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol' },
+        { id: 'gpt-6-luna', name: 'GPT-6 Luna' },
+      ],
+    });
+    expect(pickProviderAppropriateMiniModel('openai-codex', registry, false)).toBe('gpt-6-luna');
   });
 
   it('openai-codex: skips denied codex-mini variants, returns first resolvable candidate', () => {

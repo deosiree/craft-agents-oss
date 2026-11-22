@@ -8,9 +8,9 @@
 import { createLogger } from '../../utils/debug.ts';
 import type { EventBus, BaseEventPayload } from '../event-bus.ts';
 import type { AutomationHandler, PromptHandlerOptions, AutomationsConfigProvider } from './types.ts';
-import { APP_EVENTS, type AutomationEvent, type PromptAction, type PendingPrompt, type AppEvent } from '../types.ts';
+import { APP_EVENTS, type AutomationEvent, type AutomationMatcher, type PromptAction, type PendingPrompt, type AppEvent } from '../types.ts';
 import type { PermissionMode } from '../../agent/mode-types.ts';
-import { matcherMatches, buildEnvFromPayload, expandEnvVars, parsePromptReferences } from '../utils.ts';
+import { matcherMatches, buildPromptEnv, expandEnvVars, parsePromptReferences } from '../utils.ts';
 import { deriveAutomationName } from '../name-utils.ts';
 
 const log = createLogger('prompt-handler');
@@ -57,6 +57,7 @@ export class PromptHandler implements AutomationHandler {
       matcherId: string | undefined;
       automationName: string;
       telegramTopic: string | undefined;
+      semanticCondition: AutomationMatcher['semanticCondition'];
       prompts: Array<{ prompt: PromptAction; labels?: string[]; permissionMode?: PermissionMode }>;
     }> = [];
 
@@ -75,6 +76,7 @@ export class PromptHandler implements AutomationHandler {
           matcherId: matcher.id,
           automationName: deriveAutomationName(event, matcher),
           telegramTopic: telegramTopic && telegramTopic.length > 0 ? telegramTopic : undefined,
+          semanticCondition: matcher.semanticCondition,
           prompts,
         });
       }
@@ -86,14 +88,14 @@ export class PromptHandler implements AutomationHandler {
     log.debug(`[PromptHandler] Processing ${totalPrompts} prompts for ${event}`);
 
     // Build environment variables
-    const env = buildEnvFromPayload(event, payload);
+    const env = buildPromptEnv(event, payload);
 
     // Process prompts per matcher
     const pendingPrompts: PendingPrompt[] = [];
 
-    for (const { matcherId, automationName, telegramTopic, prompts } of matcherPrompts) {
+    for (const { matcherId, automationName, telegramTopic, semanticCondition, prompts } of matcherPrompts) {
       // Topic name accepts env-var expansion so users can route by event payload
-      // (e.g. telegramTopic: "Label: $LABEL"). Empty after expansion → drop it.
+      // (e.g. telegramTopic: "Label: $CRAFT_LABEL"). Empty after expansion → drop it.
       const expandedTopic = telegramTopic ? expandEnvVars(telegramTopic, env).trim() : undefined;
       const finalTopic = expandedTopic && expandedTopic.length > 0 ? expandedTopic : undefined;
 
@@ -119,6 +121,9 @@ export class PromptHandler implements AutomationHandler {
           model: prompt.model,
           thinkingLevel: prompt.thinkingLevel,
           telegramTopic: finalTopic,
+          ...(semanticCondition
+            ? { semanticCondition, event, eventPayload: payload as unknown as Record<string, unknown> }
+            : {}),
         });
       }
 

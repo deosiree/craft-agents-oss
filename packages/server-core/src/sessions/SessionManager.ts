@@ -7,8 +7,8 @@ import { createScopedLogger, CONSOLE_LOGGER, type PlatformServices, type Logger 
 import { basename, dirname, join } from 'path'
 import { existsSync } from 'fs'
 import { readFile, writeFile, mkdir } from 'fs/promises'
-import { randomUUID } from 'node:crypto'
-import { type AgentEvent, setPermissionMode, hydratePreviousPermissionMode, getPermissionModeDiagnostics, type PermissionMode, unregisterSessionScopedToolCallbacks, mergeSessionScopedToolCallbacks, AbortReason, type AuthRequest, type AuthResult, type CredentialAuthRequest, type BrowserPaneFns, generateConversationSummary } from '@craft-agent/shared/agent'
+import { createHash, randomUUID } from 'node:crypto'
+import { type AgentEvent, type ChatOptions, getPermissionMode, setPermissionMode, setGuardedModeActiveResolver, clampPermissionMode, planExecutionMode, parsePermissionMode, hydratePreviousPermissionMode, getPermissionModeDiagnostics, type PermissionMode, unregisterSessionScopedToolCallbacks, mergeSessionScopedToolCallbacks, AbortReason, type AuthRequest, type AuthResult, type CredentialAuthRequest, type BrowserPaneFns, generateConversationSummary, resolveKeepBackgroundTasksAlive } from '@craft-agent/shared/agent'
 import {
   resolveSessionConnection,
   createBackendFromConnection,
@@ -20,11 +20,12 @@ import {
   type BackendHostRuntimeContext,
   type PostInitResult,
 } from '@craft-agent/shared/agent/backend'
-import { getLlmConnection, getLlmConnections, getDefaultLlmConnection, getDefaultThinkingLevel, resetManagedAnthropicAuthEnvVars, resolveMidStreamBehavior } from '@craft-agent/shared/config'
+import { getLlmConnection, getLlmConnections, getDefaultLlmConnection, getDefaultThinkingLevel, resetManagedAnthropicAuthEnvVars, resolveMidStreamBehavior, getPersistedUiLanguage, resolveTitleLanguageName } from '@craft-agent/shared/config'
+import type { MidStreamBehavior } from '@craft-agent/shared/config'
 import { PrivilegedExecutionBroker } from '@craft-agent/server-core/services'
 import { isValidWorkingDirectory } from '../utils/path-validation'
 import { InitGate } from '@craft-agent/server-core/domain'
-import { i18n, LOCALE_REGISTRY, type LanguageCode } from '@craft-agent/shared/i18n'
+import { i18n } from '@craft-agent/shared/i18n'
 import {
   getWorkspaces,
   getWorkspaceByNameOrId,
@@ -37,11 +38,11 @@ import {
   type Workspace,
   type WorkspaceInfo,
 } from '@craft-agent/shared/config'
-import type { ActiveSessionInfo, SessionProcessingStatus } from '@craft-agent/core/types'
+import type { ActiveSessionInfo, ContextUsageSnapshot, PermissionRisk, SessionProcessingStatus } from '@craft-agent/core/types'
 import { loadWorkspaceConfig } from '@craft-agent/shared/workspaces'
 import {
   // Session persistence functions
-  listSessions as listStoredSessions,
+  listSessionsAsync as listStoredSessionsAsync,
   loadSession as loadStoredSession,
   saveSession as saveStoredSession,
   createSession as createStoredSession,
@@ -57,6 +58,7 @@ import {
   getSessionPath as getSessionStoragePath,
   ensureSessionDir,
   getSessionFilePath,
+  readSessionHeader,
   generateSessionId,
   sessionPersistenceQueue,
   getHeaderMetadataSignature,
@@ -72,17 +74,29 @@ import {
   type SessionHeader,
   pickSessionFields,
 } from '@craft-agent/shared/sessions'
-import { loadWorkspaceSources, loadAllSources, getSourcesBySlugs, isSourceUsable, type LoadedSource, type McpServerConfig, getSourcesNeedingAuth, getSourceCredentialManager, getSourceServerBuilder, type SourceWithCredential, isApiOAuthProvider, hasRenewEndpoint, SERVER_BUILD_ERRORS, TokenRefreshManager, createTokenGetter } from '@craft-agent/shared/sources'
+import { serializeHeaderCredential, loadWorkspaceSources, loadAllSources, getSourcesBySlugs, isSourceUsable, type LoadedSource, type McpServerConfig, getSourcesNeedingAuth, getSourceCredentialManager, TokenRefreshManager } from '@craft-agent/shared/sources'
+import { buildTaskSessionContext, listTaskSlugs, loadTaskSpec, parseTaskSpec, taskSubtasks, taskYamlPath, uniqueTaskSlug, type TaskSpec } from '@craft-agent/shared/tasks'
+import type { SessionTaskInfo } from '@craft-agent/session-tools-core'
+import { createTaskFromSpec, resolveCreateTaskProjectId } from '../tasks'
+import { buildPagesToolCallbacks } from '../pages/tool-callbacks'
+import { buildPrWatchToolCallbacks } from '../pr-watch/tool-callbacks'
+import { prEntryId } from '@craft-agent/shared/pr-watch'
+import { getPrAutoFixMonitor, getPrWatchRegistry } from '../handlers/rpc/pr-watch'
+import { buildDecisionToolCallbacks } from '../decisions/tool-callbacks'
+import { buildServersFromSources as buildServersFromSourcesShared } from '../sources/build-servers'
+import { buildMcpSourceToolCallbacks } from '../sources/mcp-source-tool-callbacks'
 import { ConfigWatcher, type ConfigWatcherCallbacks } from '@craft-agent/shared/config'
 import { getValidClaudeOAuthToken } from '@craft-agent/shared/auth'
 import { resolveAuthEnvVars } from '@craft-agent/shared/config'
 import { toolMetadataStore, getLastApiError } from '@craft-agent/shared/interceptor'
 import { isParentTaskTool } from '@craft-agent/shared/utils/toolNames'
+import { redactBrowserPasswordFills } from '@craft-agent/shared/agent'
 import { restoreFiles } from '@craft-agent/shared/utils/bundle-files'
 import { getCredentialManager } from '@craft-agent/shared/credentials'
 import { CraftMcpClient, McpClientPool, McpPoolServer } from '@craft-agent/shared/mcp'
-import { type Session, type SessionEvent, type FileAttachment, type SendMessageOptions, type UnreadSummary, type RemoteSessionTransferPayload, type ImportRemoteSessionTransferResult, RPC_CHANNELS, generateMessageId } from '@craft-agent/shared/protocol'
-import { messageToStored, storedToMessage, type Message, type StoredAttachment, type ToolDisplayMeta } from '@craft-agent/core/types'
+import { type Session, type SessionEvent, type FileAttachment, type SendMessageOptions, type UnreadSummary, type RemoteSessionTransferPayload, type ImportRemoteSessionTransferResult, type BackgroundTaskOutput, type StopBackgroundTaskResult, type BoundPr, type PrMonitorState, RPC_CHANNELS, generateMessageId } from '@craft-agent/shared/protocol'
+import { launchOutputFile, readBackgroundTaskOutput } from './background-task-output'
+import { messageToStored, storedToMessage, withoutRetractedMessages, type Message, type StoredAttachment, type ToolDisplayMeta, type TokenUsage } from '@craft-agent/core/types'
 import { formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrlAsync, getEmojiIcon, resetSummarizationClient, resolveToolIcon, readFileAttachment, selectSpreadMessages, normalizePath } from '@craft-agent/shared/utils'
 import { loadAllSkills, loadSkillBySlug, invalidateSkillsCache, type LoadedSkill } from '@craft-agent/shared/skills'
 import { invalidateContextFileCache } from '@craft-agent/shared/prompts/system'
@@ -90,13 +104,29 @@ import { getToolIconsDir, getMiniModel } from '@craft-agent/shared/config'
 import { getDefaultSummarizationModel } from '@craft-agent/shared/config/models'
 import type { SummarizeCallback } from '@craft-agent/shared/sources'
 import { type ThinkingLevel, DEFAULT_THINKING_LEVEL, normalizeThinkingLevel } from '@craft-agent/shared/agent/thinking-levels'
-import { evaluateAutoLabels } from '@craft-agent/shared/labels/auto'
+import { evaluateAutoLabels, autoLabelMatchToEntry, newAutoLabelEntries, type AutoLabelMatch } from '@craft-agent/shared/labels/auto'
+import { evaluateSemanticLabelsForMessage } from '../decisions/semantic-labels'
+import { classifyTurnOutcome, TURN_OUTCOME_ATTENTION_STATUS } from '../decisions/turn-outcome'
+import { isSmallTalk, titleNoLongerFits, TITLE_DRIFT_RECENT_MESSAGES } from '../decisions/smart-titles'
+import { pickTurnThinkingLevel, recordThinkingFollowUp } from '../decisions/adaptive-thinking'
+import { decideMidTurnDelivery, isContinuation } from '../decisions/mid-turn-messages'
+import { candidatesUsedBy, collectSuggestionCandidates, formatSuggestionHint, pickSuggestion, suggestionFollowUp, wantsSuggestion, type SuggestionTrace } from '../decisions/suggestions'
+import { isDecisionFeatureActive, type DecisionLayerFeature, type DecisionResult } from '@craft-agent/shared/decisions'
+import { setLargeResultFilter } from '@craft-agent/shared/utils'
+import { buildLargeResultFilter, finishLargeResultExcerpts, noteLargeResultFileUse } from '../decisions/large-results'
+import { buildGuardedModeCheck } from '../decisions/guarded-mode'
+import { buildSubagentModelPicker } from '../decisions/subagent-models'
+import { assessPermissionRisks } from '../decisions/permission-risks'
+import { checkAutomationCondition } from '../decisions/automation-condition'
 import { listLabels, loadLabelConfig } from '@craft-agent/shared/labels/storage'
-import { extractLabelId, resolveSessionLabels } from '@craft-agent/shared/labels'
-import { ensureLabelsExist } from '@craft-agent/shared/labels/crud'
+import { extractLabelId, resolveSessionLabels, findTaskItemLabelId, LabelEntrySet, canonicalizeSessionLabels, foldsValueCase, type LabelConfig } from '@craft-agent/shared/labels'
+import { ensureLabelsExist, ensureTaskItemLabel } from '@craft-agent/shared/labels/crud'
 import { loadStatusConfig } from '@craft-agent/shared/statuses/storage'
-import { AutomationSystem, createPromptHistoryEntry, appendAutomationHistoryEntry, type AutomationSystemMetadataSnapshot } from '@craft-agent/shared/automations'
+import { AutomationSystem, createPromptHistoryEntry, appendAutomationHistoryEntry, type AutomationSystemMetadataSnapshot, type PendingPrompt } from '@craft-agent/shared/automations'
 import { buildBackendRuntimeSignature, buildRestartRequiredSignature, filterAttachmentsForModelInput } from './runtime-config'
+import { validateArchiveTarget } from './archive-guards'
+import { spawnedSessionOptions } from './spawn-options'
+import { addTurnUsage, branchStartTotals, type BranchParent } from './turn-usage'
 
 // Import from server-core domain utilities
 import { sanitizeForTitle, shouldActivateBrowserOverlay, normalizeBrowserToolName, rollbackFailedBranchCreation, releaseBrowserOwnershipOnForcedStop } from '@craft-agent/server-core/domain'
@@ -362,106 +392,19 @@ async function saveClaudeTurnAnchor(
  * @param sessionPath - Optional path to session folder for saving large API responses
  * @param tokenRefreshManager - Optional TokenRefreshManager for OAuth token refresh
  */
+/**
+ * Session-flavored wrapper around the shared builder: keeps the ~7 existing
+ * call sites unchanged while routing logs through sessionLog. The
+ * implementation lives in ../sources/build-servers.ts so the pages action
+ * executor uses the exact same credential path.
+ */
 async function buildServersFromSources(
   sources: LoadedSource[],
   sessionPath?: string,
   tokenRefreshManager?: TokenRefreshManager,
   summarize?: SummarizeCallback
 ) {
-  const span = perf.span('sources.buildServers', { count: sources.length })
-  const credManager = getSourceCredentialManager()
-  const serverBuilder = getSourceServerBuilder()
-
-  // Load credentials for all sources
-  const sourcesWithCreds: SourceWithCredential[] = await Promise.all(
-    sources.map(async (source) => ({
-      source,
-      token: await credManager.getToken(source),
-      credential: await credManager.getApiCredential(source),
-    }))
-  )
-  span.mark('credentials.loaded')
-
-  // Build token getter for refreshable sources (OAuth + renew-endpoint)
-  // Uses TokenRefreshManager for unified refresh logic (DRY principle)
-  const getTokenForSource = (source: LoadedSource) => {
-    const provider = source.config.provider
-    // Provider-specific OAuth (Google, Slack, Microsoft) or generic OAuth (authType: 'oauth')
-    if (isApiOAuthProvider(provider) || source.config.api?.authType === 'oauth') {
-      const manager = tokenRefreshManager ?? new TokenRefreshManager(credManager, {
-        log: (msg) => sessionLog.debug(msg),
-      })
-      return createTokenGetter(manager, source)
-    }
-    // API renew endpoint — non-OAuth token refresh
-    if (hasRenewEndpoint(source)) {
-      const manager = tokenRefreshManager ?? new TokenRefreshManager(credManager, {
-        log: (msg) => sessionLog.debug(msg),
-      })
-      return createTokenGetter(manager, source)
-    }
-    return undefined
-  }
-
-  // Per-request credential getter for non-OAuth / non-renew API sources
-  // (bearer / header / query / basic auth).
-  //
-  // Without this, the in-process API tool captures the credential as a static
-  // string at build time and keeps using it forever — meaning a fresh JWT
-  // entered via source_credential_prompt is ignored until session restart.
-  //
-  // With this getter, every API call reads the latest credential from the
-  // vault, so credential updates take effect on the next call. OAuth and
-  // renew-endpoint sources have their own refresh logic via TokenRefreshManager
-  // and are skipped here.
-  const getCredentialForSource = (source: LoadedSource) => {
-    if (source.config.type !== 'api') return undefined
-    if (source.config.api?.authType === 'none') return undefined
-    if (isApiOAuthProvider(source.config.provider)) return undefined
-    if (source.config.api?.authType === 'oauth') return undefined
-    if (hasRenewEndpoint(source)) return undefined
-    return async () => credManager.getApiCredential(source)
-  }
-
-  // Pass sessionPath to enable saving large API responses to session folder
-  const result = await serverBuilder.buildAll(
-    sourcesWithCreds,
-    getTokenForSource,
-    sessionPath,
-    summarize,
-    getCredentialForSource,
-  )
-  span.mark('servers.built')
-  span.setMetadata('mcpCount', Object.keys(result.mcpServers).length)
-  span.setMetadata('apiCount', Object.keys(result.apiServers).length)
-
-  // Update source configs for auth errors so UI reflects actual state.
-  // Re-classify AUTH_REQUIRED → TOKEN_EXPIRED when the credential is merely
-  // expired-but-refreshable; in that case the refresh cycle handles recovery
-  // and we must NOT prematurely mark the source as needing re-auth (#710).
-  for (const error of result.errors) {
-    if (error.error !== SERVER_BUILD_ERRORS.AUTH_REQUIRED) continue
-    const source = sources.find(s => s.config.slug === error.sourceSlug)
-    if (!source) continue
-
-    const cred = await credManager.load(source)
-    const isExpiredRefreshable =
-      cred &&
-      (credManager.isExpired(cred) || credManager.needsRefresh(cred)) &&
-      (cred.refreshToken || hasRenewEndpoint(source))
-
-    if (isExpiredRefreshable) {
-      error.error = SERVER_BUILD_ERRORS.TOKEN_EXPIRED
-      sessionLog.debug(`Source ${error.sourceSlug}: TOKEN_EXPIRED — refresh cycle will handle`)
-      continue
-    }
-
-    credManager.markSourceNeedsReauth(source, 'Token missing or expired')
-    sessionLog.info(`Marked source ${error.sourceSlug} as needing re-auth`)
-  }
-
-  span.end()
-  return result
+  return buildServersFromSourcesShared(sources, sessionPath, tokenRefreshManager, summarize, sessionLog)
 }
 
 /**
@@ -508,32 +451,6 @@ async function refreshExpiredCredentials(
   }))
 
   return { refreshedCount: refreshed.length, failedSources }
-}
-
-/**
- * Apply bridge-mcp-server updates for backends that use it.
- * Delegates to the backend's own applyBridgeUpdates() method.
- * Each backend handles its own strategy via applyBridgeUpdates().
- */
-async function applyBridgeUpdates(
-  agent: AgentInstance,
-  sessionPath: string,
-  enabledSources: LoadedSource[],
-  mcpServers: Record<string, import('@craft-agent/shared/agent/backend').SdkMcpServerConfig>,
-  sessionId: string,
-  workspaceRootPath: string,
-  context: string,
-  poolServerUrl?: string
-): Promise<void> {
-  await agent.applyBridgeUpdates({
-    sessionPath,
-    enabledSources,
-    mcpServers,
-    sessionId,
-    workspaceRootPath,
-    context,
-    poolServerUrl,
-  })
 }
 
 /**
@@ -593,7 +510,7 @@ async function resolveToolDisplayMeta(
       const serverSlug = parts[1]
       const toolSlug = parts.slice(2).join('__')
 
-      // Internal MCP server tools (session, docs)
+      // Internal MCP server tools (session)
       const internalMcpServers: Record<string, Record<string, string>> = {
         'session': {
           'SubmitPlan': 'Submit Plan',
@@ -612,9 +529,6 @@ async function resolveToolDisplayMeta(
           'update_user_preferences': 'Update Preferences',
           'send_developer_feedback': 'Send Feedback',
           'browser_tool': 'Browser',
-        },
-        'craft-agents-docs': {
-          'SearchCraftAgents': 'Search Docs',
         },
       }
 
@@ -758,6 +672,51 @@ async function resolveToolDisplayMeta(
 /** Agent type - unified backend interface for all providers */
 type AgentInstance = AgentBackend
 
+/**
+ * Status of a background task in the main-process registry.
+ * - `running`   — backgrounded and no terminal notification seen yet.
+ * - `completed`/`failed`/`stopped` — a real SDK task_notification arrived.
+ * - `orphaned`  — the turn that owned the task ended before a terminal
+ *   notification arrived. With the (default) per-turn subprocess model the task
+ *   almost certainly died with the subprocess, so reporting it as still
+ *   "running" would be a lie. Once WS2 keep-alive is enabled these are no longer
+ *   produced because the query outlives the turn.
+ */
+type BackgroundTaskStatus = 'running' | 'completed' | 'failed' | 'stopped' | 'orphaned'
+
+/** A background task tracked from launch, for cross-subprocess status queries. */
+interface RunningBackgroundTask {
+  taskId: string
+  toolUseId?: string
+  intent?: string
+  /** ms timestamp when the task was backgrounded */
+  startTime: number
+  /** ms timestamp of the last task_progress notification, if any */
+  lastProgressAt?: number
+  /** elapsed seconds from the most recent progress notification, if any */
+  elapsedSeconds?: number
+  status: BackgroundTaskStatus
+  /** ms timestamp when the task reached a terminal/orphaned status */
+  completedAt?: number
+  /** turn that launched the task (used to orphan on that turn's completion) */
+  turnId?: string
+  /** Workflow run id (wf_...) — set when this task is a Workflow launch. */
+  workflowId?: string
+  /** Count of workflow sub-agents completed so far (Workflow tasks only). */
+  agentsCompleted?: number
+  /** What the session's agent launched: a background agent, a Workflow, a Bash command, or another task (Monitor, MCP...). */
+  kind?: 'agent' | 'workflow' | 'shell' | 'task'
+  /**
+   * A completion for a task this session's agent did not launch (typically a subagent's own
+   * background task). Its start time is unknown, and it never wakes the session.
+   */
+  untracked?: boolean
+  /** The session's own task, but its launch was not seen: the start time is unknown. */
+  startUnknown?: boolean
+  /** The user stopped it from its chip: its `stopped` completion is expected, so it wakes nothing. */
+  stopRequestedAt?: number
+}
+
 interface ManagedSession {
   id: string
   workspace: Workspace
@@ -768,6 +727,8 @@ interface ManagedSession {
   stopRequested?: boolean
   lastMessageAt: number
   streamingText: string
+  /** Identity of the unfinished assistant text, used for retry discard boundaries. */
+  streamingTurnId?: string
   // Incremented each time a new message starts processing.
   // Used to detect if a follow-up message has superseded the current one (stale-request guard).
   processingGeneration: number
@@ -777,12 +738,18 @@ interface ManagedSession {
   // See: packages/shared/src/agent/tool-matching.ts
   // Session name (user-defined or AI-generated)
   name?: string
+  /** Last title the app set (initial or AI); a different `name` means the user or an external edit renamed it. */
+  autoTitle?: string
+  /** Smart titles: the first message was small talk, so the next request gets the title. */
+  titleDeferred?: boolean
+  /** Smart titles: user-message count at the last drift check. */
+  titleCheckedAtUserCount?: number
   isFlagged: boolean
   /** Whether this session is archived */
   isArchived?: boolean
   /** Timestamp when session was archived (for retention policy) */
   archivedAt?: number
-  /** Permission mode for this session ('safe', 'ask', 'allow-all') */
+  /** Permission mode for this session ('safe', 'ask', 'guarded', 'allow-all') */
   permissionMode?: PermissionMode
   /** Previous permission mode (preserved across restarts for session_state modeTransition context) */
   previousPermissionMode?: PermissionMode
@@ -792,6 +759,8 @@ interface ManagedSession {
   poolServer?: McpPoolServer
   // SDK session ID for conversation continuity
   sdkSessionId?: string
+  /** Accept & Compact state; persisted with the session header. */
+  pendingPlanExecution?: StoredSession['pendingPlanExecution']
   // Token usage for display
   tokenUsage?: {
     inputTokens: number
@@ -803,6 +772,10 @@ interface ManagedSession {
     cacheCreationTokens?: number
     /** Model's context window size in tokens (from SDK modelUsage) */
     contextWindow?: number
+    /** Current occupancy, separate from cumulative/billable counters. */
+    contextUsage?: ContextUsageSnapshot
+    /** Backend running totals already counted into costUsd/outputTokens (see `addTurnUsage`). */
+    lastRunningTotals?: { costUsd: number; outputTokens: number }
   }
   // Session status (user-controlled) - determines open vs closed
   // Dynamic status ID referencing workspace status config
@@ -819,6 +792,24 @@ interface ManagedSession {
   enabledSourceSlugs?: string[]
   // Labels applied to this session (additive tags, many-per-session)
   labels?: string[]
+  // Workspace-scoped project binding (undefined = unbound)
+  projectId?: string
+  // Parent session id — when set, this session is a subtask of the parent (undefined = top-level task)
+  parentSessionId?: string
+  // Kanban board column id ('todo' | 'in-progress' | 'done'); independent of sessionStatus
+  kanbanColumn?: string
+  // Tasks Conductor: slug of the task spec this session belongs to (orchestrator + child nodes)
+  taskSlug?: string
+  // Tasks Conductor: id of the run that spawned this child session (child nodes only)
+  taskRunId?: string
+  // Tasks Conductor: id of the DAG node this child session executes (child nodes only)
+  taskNodeId?: string
+  // Tasks Conductor: total DAG node count (orchestrator only) — stable board progress denominator
+  taskNodeCount?: number
+  // Tasks Conductor: hidden generate-time orchestrator awaiting validated adoption (off the board)
+  taskDraft?: boolean
+  // Tasks Conductor: fingerprint of the task context last sent to this task session's agent
+  taskContextFingerprint?: string
   // Working directory for this session (used by agent for bash commands)
   workingDirectory?: string
   // SDK cwd for session storage - set once at creation, never changes.
@@ -836,6 +827,12 @@ interface ManagedSession {
   connectionLocked?: boolean
   // Thinking level for this session ('off', 'think', 'max')
   thinkingLevel?: ThinkingLevel
+  // Coding mode: lean coding prompt + session-tool profile (fixed once the session has messages)
+  codingMode?: boolean
+  // Coding mode: PRs pinned to this session (chat-header PR carousel; see pr_bind / pr_unbind)
+  boundPrs?: BoundPr[]
+  // Coding mode: per-PR monitor state (auto-fix toggle + what it last acted on), keyed by PR id
+  prMonitors?: Record<string, PrMonitorState>
   // System prompt preset for mini agents ('default' | 'mini')
   systemPromptPreset?: 'default' | 'mini' | string
   // Role/type of the last message (for badge display without loading messages)
@@ -867,11 +864,27 @@ interface ManagedSession {
     options?: SendMessageOptions
     messageId?: string  // Pre-generated ID for matching with UI
     optimisticMessageId?: string  // Frontend's ID for reliable event matching
+    /**
+     * Mid-turn messages: replay together with this earlier entry (same request). A reference, not
+     * a flag, so an entry spliced in between (a recovered steer) never gets merged by position.
+     */
+    mergeWith?: object
+    /** Mid-turn messages: the pending continuation check that may set `mergeWith`. */
+    continuationCheck?: Promise<void>
   }>
-  // Map of shellId -> command for killing background shells
-  backgroundShellCommands: Map<string, string>
+  // Original host payloads for backends that can return undelivered text steers.
+  // Runtime-only; Pi's native steering does not opt into an acknowledgement protocol.
+  acceptedSteers?: Map<string, ManagedSession['messageQueue'][number]>
   // Map of taskId -> output info for background task results
   backgroundTaskOutputs: Map<string, { outputFile: string; summary: string; status: string; completedAt: number }>
+  // Registry of background tasks (running + recently-terminal) for this session.
+  // Unlike backgroundTaskOutputs (which only stores COMPLETED tasks for output
+  // retrieval), this tracks tasks from the moment they are backgrounded, so a
+  // cross-subprocess "status?" query can enumerate what is actually live. The
+  // SDK's in-subprocess task tools cannot answer this: their state dies with the
+  // subprocess at turn end, so this main-process registry is the real source of
+  // truth for background-task status. See RunningBackgroundTask.
+  backgroundTaskRegistry: Map<string, RunningBackgroundTask>
   // Whether messages have been loaded from disk (for lazy loading)
   messagesLoaded: boolean
   // Pending auth request tracking (for unified auth flow)
@@ -880,6 +893,11 @@ interface ManagedSession {
   // Auth retry tracking (for mid-session token expiry)
   // Store last sent message/attachments to enable retry after token refresh
   lastSentMessage?: string
+  // IDs of the user bubbles the last send stands for (several for a merged replay); the auth retry
+  // removes exactly these before resending.
+  lastSentMessageIds?: string[]
+  // Merged replays in flight: first entry's message ID → IDs of every bubble it replays.
+  replayMergedIds?: Map<string, string[]>
   lastSentAttachments?: FileAttachment[]
   lastSentStoredAttachments?: StoredAttachment[]
   lastSentOptions?: SendMessageOptions
@@ -889,6 +907,11 @@ interface ManagedSession {
   authRetryInProgress?: boolean
   // Whether this session is hidden from session list (e.g., mini edit sessions)
   hidden?: boolean
+  // Nobody answers prompts here (CLI runs); in memory only. See isAttendedSession.
+  unattended?: boolean
+  // Incremented by every Stop (cancelProcessing). A turn captures it when it starts: a risk-badge
+  // prompt or a turn start that sees it change was stopped meanwhile.
+  stopEpoch?: number
   branchFromMessageId?: string
   // Branch context strategy:
   // - sdk-fork: provider-level fork from parent SDK session
@@ -910,10 +933,13 @@ interface ManagedSession {
   transferredSessionSummary?: string
   // Whether the transferred-session summary has already been injected.
   transferredSessionSummaryApplied?: boolean
+  // Continued from another session: its summary is still being generated (continueSessionInNewSession).
+  // The first turn waits for it, at most HANDOFF_SUMMARY_WAIT_MS. Not persisted.
+  pendingHandoffSummary?: Promise<void>
   // Token refresh manager for OAuth token refresh with rate limiting
   tokenRefreshManager: TokenRefreshManager
   // Metadata for sessions created by automations
-  triggeredBy?: { automationName?: string; event?: string; timestamp?: number }
+  triggeredBy?: { automationName?: string; automationId?: string; event?: string; timestamp?: number; depth?: number }
   // Promise that resolves when the agent instance is ready (for title gen to await)
   agentReady?: Promise<void>
   agentReadyResolve?: () => void
@@ -950,6 +976,29 @@ interface ManagedSession {
     /** True after the first matching sendMessage consumes the slot; later matches drop. */
     committed: boolean
   }
+  /**
+   * Exact content of the server's own auto-retry, set just before it calls sendMessage so the
+   * retry is recognised: it runs hidden (the user already sees their message and the activation)
+   * and triggers no per-message decision points.
+   */
+  pendingActivationResend?: string
+  /** Messages steered into the running turn; an auto-retry carries them after the original request. */
+  turnSteers?: string[]
+  /** Thinking level adaptive thinking chose for the current request; an auto-retry keeps it. */
+  turnThinkingOverride?: ThinkingLevel | null
+  /**
+   * The current request began with a message the user sent, not an app-generated hidden one (a
+   * background-task wake-up). Source-activation and auth retries keep it.
+   */
+  turnFromUser?: boolean
+  /** Suggestion hint sent with the current request; an auth retry sends it again. */
+  turnSuggestionHint?: string | null
+  /** Task context sent with the current request; an auth retry sends it again. */
+  turnTaskContext?: string | null
+  /** Adaptive thinking's answer for the last user turn, for the next turn's `corrected`/`accepted` follow-up. */
+  thinkingTrace?: DecisionResult
+  /** Suggestions answer for the current request and the candidates it used, for the follow-up line. */
+  suggestionTrace?: { trace: SuggestionTrace; used: Set<string> }
 }
 
 const PI_SDK_MESSAGE_ID_CACHE_LIMIT = 256
@@ -983,6 +1032,62 @@ export function claimAutoRetryPending(
   }
 
   return 'send'
+}
+
+/**
+ * Most-recent non-empty user message content, for the source-activation auto-retry
+ * fallback (bugfix/session-continuation). The per-turn capture
+ * (`getCurrentTurnUserMessage`) can come back empty — an empty/attachment-only turn,
+ * or a capture that raced turn teardown — which used to strand the session: the
+ * activation ended the turn but nothing was re-sent. Falling back to the last
+ * persisted user message keeps the turn continuing, while preserving the "no bogus
+ * empty resend" intent (returns '' only when there is genuinely nothing to resend).
+ */
+export function lastUserMessageContent(messages: Message[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role === 'user' && typeof m.content === 'string' && m.content.trim()) {
+      return m.content
+    }
+  }
+  return ''
+}
+
+/**
+ * The source-activation auto-retry. `plain` is the original request plus the `[<slug> activated]`
+ * suffix (also what a legacy renderer's own retry sends, so it is the dedupe key). `retry` is what
+ * the server sends: corrections steered into the turn follow the original request, so the latest
+ * instruction the model reads is the corrected one, not the request it replaced.
+ */
+export function buildActivationRetryMessage(original: string, steers: readonly string[], sourceSlug: string): { plain: string; retry: string } {
+  const suffix = `[${sourceSlug} activated]`
+  const plain = `${original}\n\n${suffix}`
+  const kept = steers.filter(text => text.trim())
+  return { plain, retry: kept.length > 0 ? `${original}\n\n${kept.join('\n\n')}\n\n${suffix}` : plain }
+}
+
+/** Longest chain of automation-created sessions that may trigger further automations (loop guard). */
+export const MAX_AUTOMATION_CHAIN_DEPTH = 3
+
+/**
+ * Whether someone can answer a prompt in this session: not an automation, task-run, hidden, mini
+ * or unattended session. `unattended` marks `craft run` sessions and is inherited by sessions an
+ * unattended session spawns (not by subtasks a user adds under it).
+ */
+export function isAttendedSession(managed: ManagedSession): boolean {
+  return !(managed.triggeredBy || managed.taskRunId || managed.taskSlug || managed.hidden || managed.unattended
+    || managed.systemPromptPreset === 'mini')
+}
+
+/**
+ * Whether the session's conversation has started. The agent's system prompt is fixed from then on
+ * (Claude pins it per SDK session), so per-session settings that shape it,
+ * like coding mode, can only change before this.
+ */
+export function hasConversationStarted(managed: Pick<ManagedSession, 'sdkSessionId' | 'messageCount' | 'messages'>): boolean {
+  return !!managed.sdkSessionId
+    || (managed.messageCount ?? 0) > 0
+    || managed.messages.some(m => m.role === 'user')
 }
 
 /**
@@ -1025,8 +1130,8 @@ export function createManagedSession(
     processingGeneration: 0,
     isFlagged: (s.isFlagged ?? false) as boolean,
     messageQueue: [],
-    backgroundShellCommands: new Map(),
     backgroundTaskOutputs: new Map(),
+    backgroundTaskRegistry: new Map(),
     messagesLoaded: false,
     tokenRefreshManager: new TokenRefreshManager(getSourceCredentialManager(), {
       log: (msg) => sessionLog.debug(msg),
@@ -1067,6 +1172,17 @@ const DEFAULT_TOKEN_USAGE = {
   contextTokens: 0, costUsd: 0,
 }
 
+/** Two bound PRs are the same pin when their host/owner/repo/number match (case-insensitive). */
+function sameBoundPr(
+  a: { host: string; owner: string; repo: string; number: number },
+  b: { host: string; owner: string; repo: string; number: number },
+): boolean {
+  return a.number === b.number
+    && a.host.toLowerCase() === b.host.toLowerCase()
+    && a.owner.toLowerCase() === b.owner.toLowerCase()
+    && a.repo.toLowerCase() === b.repo.toLowerCase()
+}
+
 /**
  * Convert a ManagedSession to a renderer-side Session object.
  * Uses pickSessionFields() for persistent fields so new fields propagate automatically.
@@ -1087,6 +1203,8 @@ function managedToSession(m: ManagedSession, overrides?: Partial<Session>): Sess
     isProcessing: m.isProcessing,
     sessionFolderPath: getSessionStoragePath(m.workspace.rootPath, m.id),
     supportsBranching: resolveSupportsBranching(m),
+    // The source's session folder is named by its id
+    branchFromSessionId: m.branchFromSessionPath ? basename(m.branchFromSessionPath) : undefined,
     ...overrides,
   } as Session
 }
@@ -1094,13 +1212,118 @@ function managedToSession(m: ManagedSession, overrides?: Partial<Session>): Sess
 // Performance: Batch IPC delta events to reduce renderer load
 const DELTA_BATCH_INTERVAL_MS = 50  // Flush batched deltas every 50ms
 
+/**
+ * How long the first turn of a session continued from another one (Coding mode switch) waits for
+ * the earlier conversation's summary, which is generated in the background (a few seconds).
+ */
+const HANDOFF_SUMMARY_WAIT_MS = 30_000
+
 interface PendingDelta {
   delta: string
   turnId?: string
 }
 
+/** Frame an app-generated message the agent receives as a user turn, so it is not mistaken for the user. */
+export function labelSystemNotice(text: string): string {
+  return [
+    '<system-notification>',
+    'Sent by Craft Agents automatically, not typed by the user. It is not a reply to, or approval of, anything you asked.',
+    text,
+    '</system-notification>',
+  ].join('\n')
+}
+
+/**
+ * In-process session-completion signal for the Tasks Conductor.
+ *
+ * Emitted once per turn from `onProcessingStopped` when the session's message
+ * queue is empty (i.e. true completion, not a hand-off between queued turns),
+ * carrying the stop `reason`. This is an internal, side-effect-free seam — it is
+ * NOT a renderer event and NOT exposed to agents. A turn the user stopped is
+ * `interrupted` (or `timeout` when it did not drain), never `complete`.
+ */
+export interface SessionCompletionEvent {
+  sessionId: string
+  workspaceId: string
+  reason: 'complete' | 'interrupted' | 'error' | 'timeout'
+  /** The final (non-intermediate) assistant message this turn produced, if any. */
+  finalMessageId?: string
+  /** That message's text. Absent when the turn produced none: never an earlier turn's reply. */
+  finalText?: string
+  /**
+   * Background agents and Workflows the session launched that are still running after the turn.
+   * Their completion wakes the session for another turn, so the work is not finished yet.
+   * Background shells and other tasks (Monitor...) are not counted: they may never end.
+   */
+  backgroundWorkRunning?: number
+  /** The turn answered a message the user sent; false for an app-generated one (a background-task wake-up). */
+  fromUser?: boolean
+  /** The session's cumulative token usage, so the Conductor can meter token_budget without re-fetching. */
+  tokenUsage?: TokenUsage
+}
+
+export interface MidStreamDeliveryOutcome {
+  shouldQueue: boolean
+  wasInterrupted: boolean
+}
+
+/**
+ * Translate backend delivery into queue/interruption semantics. Queue mode never
+ * aborts the active turn; a failed steer does, and must annotate the replay.
+ */
+export function resolveMidStreamDeliveryOutcome(
+  behavior: MidStreamBehavior,
+  steered: boolean,
+): MidStreamDeliveryOutcome {
+  return {
+    shouldQueue: !steered,
+    wasInterrupted: behavior === 'steer' && !steered,
+  }
+}
+
+/**
+ * Whether a mid-stream text message should be steered into the live turn.
+ * A manual compaction owns the turn without an agent loop to consume steers,
+ * so the message is queued for replay after `complete` instead (OSS #1058).
+ */
+export function shouldAttemptMidStreamSteer(
+  behavior: MidStreamBehavior,
+  textOnly: boolean,
+  agent: { isCompactionInFlight?: () => boolean } | null | undefined,
+): boolean {
+  if (behavior !== 'steer' || !textOnly || !agent) return false
+  return agent.isCompactionInFlight?.() !== true
+}
+
+/**
+ * Mid-turn messages: whether a queued entry is one half of a continued message, i.e. it continues
+ * an entry still waiting in the queue or a waiting entry continues it. Such pairs replay together.
+ */
+export function isInQueuedContinuation(queue: ReadonlyArray<{ message: string; mergeWith?: object }>, entry: { message: string; mergeWith?: object }): boolean {
+  return (entry.mergeWith !== undefined && queue.some(other => other === entry.mergeWith))
+    || queue.some(other => other.mergeWith === entry)
+}
+
+/** Text redirects cannot carry attachments or options that affect model input. */
+export function canSteerTextPayload(
+  attachments?: FileAttachment[],
+  storedAttachments?: StoredAttachment[],
+  options?: SendMessageOptions,
+): boolean {
+  if (attachments?.length || storedAttachments?.length) return false
+  return !Object.entries(options ?? {}).some(([key, value]) => {
+    if (value === undefined || key === 'optimisticMessageId') return false
+    if ((key === 'skillSlugs' || key === 'badges') && Array.isArray(value) && !value.length) return false
+    if (key === 'hidden' && value === false) return false
+    // Unknown future options conservatively use the full-payload path.
+    return true
+  })
+}
+
 export class SessionManager implements ISessionManager {
   private sessions: Map<string, ManagedSession> = new Map()
+  /** Test seam for HANDOFF_SUMMARY_WAIT_MS. */
+  private handoffSummaryWaitMs = HANDOFF_SUMMARY_WAIT_MS
   // Delta batching for performance - reduces IPC events from 50+/sec to ~20/sec
   private pendingDeltas: Map<string, PendingDelta> = new Map()
   private deltaFlushTimers: Map<string, NodeJS.Timeout> = new Map()
@@ -1132,10 +1355,24 @@ export class SessionManager implements ISessionManager {
    * marked as unread when assistant completes - if user is viewing it, don't mark unread.
    */
   private activeViewingSession: Map<string, string> = new Map()
-  /** Coordinates startup initialization waiters from IPC handlers. */
+  /** Coordinates fast-path startup waiters (auth, config watchers). Resolves
+   *  before sessions are loaded so the first window can open. */
   private initGate = new InitGate()
-  // O(1) index: taskId → sessionId for background task output lookup (avoids O(n) session scan)
-  private taskOutputIndex: Map<string, string> = new Map()
+  /** Coordinates waiters for the background session-disk load, which runs off
+   *  the critical path (so cloud-evicted files can't block the first window —
+   *  craft-agents#1113). List endpoints await this via waitForSessionsLoaded. */
+  private sessionsGate = new InitGate()
+  /**
+   * WS2 keep-alive flag (default ON, opt-out via `CRAFT_KEEP_BG_AGENTS_ALIVE=0`).
+   * When true, a persistent streaming query keeps the subprocess alive across
+   * turns so background sub-agents survive, and orphaning is suppressed. When
+   * false (kill-switch), sub-agents are bound to a single turn's subprocess and
+   * die at turn end, so markOrphanedBackgroundTasks() flips still-running registry
+   * entries to `orphaned` on turn completion. Resolved via the shared
+   * `resolveKeepBackgroundTasksAlive` so the main process and the Claude backend
+   * can never disagree about whether keep-alive is on.
+   */
+  private readonly keepBackgroundTasksAlive: boolean = resolveKeepBackgroundTasksAlive()
   /**
    * Per-session in-flight runtime-refresh promise. Ensures `updateRuntimeConfig`
    * (or a dispose) cannot overlap with another refresh OR with a send-path
@@ -1162,6 +1399,508 @@ export class SessionManager implements ISessionManager {
   }) => Promise<void>
 
   /**
+   * Merge auto-label matches into the session's labels (valued entries as `id::value`,
+   * plain ones as the bare id), persist and broadcast when anything changed. Labels the
+   * session already has by meaning are skipped (`newAutoLabelEntries`), so case variants
+   * and legacy `bug::bug` entries never pile up or fire LabelAdd again.
+   */
+  private applyAutoLabelMatches(managed: ManagedSession, matches: AutoLabelMatch[], labelTree: LabelConfig[]): void {
+    if (matches.length === 0) return
+    const existingLabels = managed.labels ?? []
+    const newEntries = newAutoLabelEntries(existingLabels, matches, labelTree)
+    if (newEntries.length === 0) return
+    managed.labels = [...existingLabels, ...newEntries]
+    this.persistSession(managed)
+    this.sendEvent({
+      type: 'labels_changed',
+      sessionId: managed.id,
+      labels: managed.labels,
+    }, managed.workspace.id)
+  }
+
+  /**
+   * Semantic auto-label rules (decision model). Off the turn's critical path: the
+   * first await yields so even the settings read happens after the caller has
+   * moved on. A session deleted while we waited is left alone, and a label the
+   * user removed during the round trip is not re-added. Never throws.
+   */
+  private async applySemanticAutoLabels(managed: ManagedSession, message: string, labelTree: LabelConfig[]): Promise<void> {
+    const labelsAtDispatch = [...(managed.labels ?? [])]
+    try {
+      await Promise.resolve()
+      const matches = await evaluateSemanticLabelsForMessage(message, labelTree, {
+        sessionId: managed.id,
+        existingEntries: labelsAtDispatch,
+        log: (line) => sessionLog.info(line),
+      })
+      if (matches.length === 0) return
+      if (this.sessions.get(managed.id) !== managed) return
+      // Present at dispatch → either still present (dedupe) or removed by the user since (respect it).
+      const atDispatch = new LabelEntrySet(labelsAtDispatch, foldsValueCase(labelTree))
+      const fresh = matches.filter(m => !atDispatch.has(autoLabelMatchToEntry(m)))
+      this.applyAutoLabelMatches(managed, fresh, labelTree)
+    } catch (e) {
+      sessionLog.warn(`Semantic auto-label evaluation failed for session ${managed.id}:`, e)
+    }
+  }
+
+  /**
+   * Turn outcome (decision model, toggle `turnOutcome`): when a completed turn ends with
+   * the agent asking the user something or giving up, move an open session to Needs
+   * Review. Off the completion path; never throws, never touches a closed session, and
+   * the answer is dropped if a new turn started meanwhile.
+   */
+  private async applyTurnOutcome(managed: ManagedSession, finalMessageId: string): Promise<void> {
+    try {
+      await Promise.resolve()
+      const index = managed.messages.findIndex(m => m.id === finalMessageId)
+      const reply = index === -1 ? undefined : managed.messages[index]?.content
+      if (!reply) return
+      let request: string | undefined
+      for (let i = index - 1; i >= 0 && request === undefined; i--) {
+        if (managed.messages[i]?.role === 'user') request = managed.messages[i]?.content
+      }
+
+      const result = await classifyTurnOutcome({ request, reply }, {
+        sessionId: managed.id,
+        log: (line) => sessionLog.info(line),
+      })
+      if (!result || result.outcome === 'finished') return
+      // Dropped when a newer turn started or already finished meanwhile: it answers for that turn.
+      if (this.sessions.get(managed.id) !== managed || managed.isProcessing) return
+      if (this.getLastFinalAssistantMessageId(managed.messages) !== finalMessageId) return
+
+      const statuses = loadStatusConfig(managed.workspace.rootPath).statuses
+      const target = statuses.find(status => status.id === TURN_OUTCOME_ATTENTION_STATUS && status.category === 'open')
+      const current = statuses.find(status => status.id === managed.sessionStatus)
+      if (!target || managed.sessionStatus === target.id || current?.category === 'closed') return
+      sessionLog.info(`Turn outcome ${result.outcome} (confidence ${result.confidence.toFixed(2)}): session ${managed.id} → ${target.id}`)
+      await this.setSessionStatus(managed.id, target.id)
+    } catch (e) {
+      sessionLog.warn(`Turn outcome check failed for session ${managed.id}:`, e)
+    }
+  }
+
+  /**
+   * Automation loop guard. An automation never runs for an event about a session it created
+   * itself: that session's own prompt (a semantic or regex label rule matching it, a label the
+   * matcher puts on its sessions) would otherwise re-trigger it without end. Chains through
+   * other automations stop at `MAX_AUTOMATION_CHAIN_DEPTH` sessions deep. Runs before the
+   * semantic condition, so a loop costs no model call either.
+   */
+  private automationLoopGuard(pending: PendingPrompt): { run: true; depth: number } | { run: false; reason: string } {
+    const payload = pending.eventPayload ?? {}
+    const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : undefined
+    const origin = sessionId ? this.sessions.get(sessionId)?.triggeredBy : undefined
+    if (!origin) return { run: true, depth: 1 }
+    // Sessions created before automation ids were recorded carry only the name.
+    const sameAutomation = origin.automationId
+      ? origin.automationId === pending.matcherId
+      : !!origin.automationName && origin.automationName === pending.automationName
+    if (sameAutomation) return { run: false, reason: 'the event is about a session this automation created (loop guard)' }
+    const depth = (origin.depth ?? 1) + 1
+    if (depth > MAX_AUTOMATION_CHAIN_DEPTH) {
+      return { run: false, reason: `automation chain deeper than ${MAX_AUTOMATION_CHAIN_DEPTH} sessions (loop guard)` }
+    }
+    return { run: true, depth }
+  }
+
+  /**
+   * Automation `semanticCondition` (decision model, toggle `automationConditions`). Without a
+   * condition, or when the model is off, unavailable or fails, the prompt runs as it always did; a
+   * "yes" probability below the condition's threshold (default 0.5) skips it. For session events the
+   * question also sees the session's latest exchange (loaded first for sessions not opened yet).
+   */
+  private async shouldRunPromptAutomation(pending: PendingPrompt): Promise<{ run: boolean; reason?: string }> {
+    if (!pending.semanticCondition) return { run: true }
+    try {
+      const payload = pending.eventPayload ?? {}
+      const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : undefined
+      const managed = sessionId ? this.sessions.get(sessionId) : undefined
+      // Sessions changed from outside the app since launch have only their metadata in memory.
+      if (managed) await this.ensureMessagesLoaded(managed)
+      const lastContent = (role: 'user' | 'assistant') =>
+        managed?.messages.findLast(message => message.role === role && !message.isIntermediate)?.content
+      const verdict = await checkAutomationCondition(pending.semanticCondition, {
+        event: pending.event ?? 'unknown',
+        automationName: pending.automationName,
+        payload,
+        session: managed
+          ? {
+              name: managed.name,
+              labels: managed.labels,
+              status: managed.sessionStatus,
+              lastUserMessage: lastContent('user'),
+              lastAssistantMessage: lastContent('assistant'),
+            }
+          : undefined,
+      }, { sessionId, matcherId: pending.matcherId, log: (line) => sessionLog.info(line) })
+      if (!verdict || verdict.run) return { run: true }
+      return { run: false, reason: `condition not met ("yes" probability ${verdict.probability.toFixed(2)})` }
+    } catch (e) {
+      sessionLog.warn('[Automations] Semantic condition check failed, running the automation:', e)
+      return { run: true }
+    }
+  }
+
+  /**
+   * Run the prompt actions an automation event produced. Each prompt starts as soon as its own
+   * `semanticCondition` (decision model) is judged, so prompts without one never wait on another
+   * matcher's check. A matcher is judged once per batch, so its prompt actions all run or are all
+   * skipped. Every outcome is written to the automation history.
+   */
+  private async runReadyPrompts(workspaceId: string, workspaceRootPath: string, readyPrompts: PendingPrompt[]): Promise<void> {
+    const conditionChecks = new Map<string, Promise<{ run: boolean; reason?: string }>>()
+    const checkCondition = (pending: PendingPrompt) => {
+      if (!pending.semanticCondition || !pending.matcherId) return this.shouldRunPromptAutomation(pending)
+      let check = conditionChecks.get(pending.matcherId)
+      if (!check) conditionChecks.set(pending.matcherId, check = this.shouldRunPromptAutomation(pending))
+      return check
+    }
+    const writeHistory = (entry: Parameters<typeof createPromptHistoryEntry>[0]) =>
+      appendAutomationHistoryEntry(workspaceRootPath, createPromptHistoryEntry(entry))
+        .catch(e => sessionLog.warn('[Automations] Failed to write history:', e))
+
+    await Promise.all(readyPrompts.map(async (pending, idx) => {
+      const guard = this.automationLoopGuard(pending)
+      if (!guard.run) {
+        sessionLog.info(`[Automations] ${pending.automationName ?? 'Automation'} skipped: ${guard.reason}`)
+        if (pending.matcherId) void writeHistory({ matcherId: pending.matcherId, ok: true, prompt: pending.prompt, skipped: guard.reason })
+        return
+      }
+      const verdict = await checkCondition(pending)
+      if (!verdict.run) {
+        sessionLog.info(`[Automations] ${pending.automationName ?? 'Automation'} skipped: ${verdict.reason}`)
+        if (pending.matcherId) void writeHistory({ matcherId: pending.matcherId, ok: true, prompt: pending.prompt, skipped: verdict.reason })
+        return
+      }
+
+      // Execute the prompt automation by creating a new session; history gets the session ID.
+      try {
+        const { sessionId } = await this.executePromptAutomation({
+          workspaceId,
+          workspaceRootPath,
+          prompt: pending.prompt,
+          labels: pending.labels,
+          permissionMode: pending.permissionMode,
+          mentions: pending.mentions,
+          llmConnection: pending.llmConnection,
+          model: pending.model,
+          thinkingLevel: pending.thinkingLevel,
+          automationName: pending.automationName,
+          automationId: pending.matcherId,
+          triggerEvent: pending.event,
+          chainDepth: guard.depth,
+          telegramTopic: pending.telegramTopic,
+        })
+        if (pending.matcherId) void writeHistory({ matcherId: pending.matcherId, ok: true, sessionId, prompt: pending.prompt })
+        sessionLog.info(`[Automations] Created session ${sessionId} from prompt action`)
+      } catch (error) {
+        if (pending.matcherId) void writeHistory({ matcherId: pending.matcherId, ok: false, prompt: pending.prompt, error: String(error) })
+        sessionLog.error(`[Automations] Failed to execute prompt action ${idx + 1}:`, error)
+      }
+    }))
+  }
+
+  /**
+   * Smart titles (decision model, toggle `smartTitles`): a first message that is only small
+   * talk gets no AI title; the next request is titled instead (see sendMessage).
+   */
+  private async generateTitleUnlessSmallTalk(managed: ManagedSession, message: string): Promise<void> {
+    try {
+      if (await isSmallTalk(message, { sessionId: managed.id, log: (line) => sessionLog.info(line) })) {
+        managed.titleDeferred = true
+        sessionLog.info(`[smart-titles] Small talk in session ${managed.id}: waiting for a request to title`)
+        return
+      }
+    } catch (e) {
+      sessionLog.warn(`[smart-titles] Small-talk check failed for session ${managed.id}:`, e)
+    }
+    await this.generateTitle(managed, message)
+  }
+
+  /**
+   * Smart titles: every few user messages, refresh an automatic title that no longer
+   * describes the conversation. Titles the user set are never touched.
+   */
+  private async refreshTitleIfDrifted(managed: ManagedSession): Promise<void> {
+    try {
+      if (!managed.name || managed.name !== managed.autoTitle || managed.titleDeferred) return
+      // Auto-retries and nudges are hidden: they are not new user messages.
+      const userMessages = managed.messages.filter(m => m.role === 'user' && !m.hidden).map(m => m.content)
+      const checkedAt = managed.titleCheckedAtUserCount ?? 1
+      if (userMessages.length < TITLE_DRIFT_RECENT_MESSAGES || userMessages.length - checkedAt < TITLE_DRIFT_RECENT_MESSAGES) return
+      managed.titleCheckedAtUserCount = userMessages.length
+      const drifted = await titleNoLongerFits(managed.name, userMessages, { sessionId: managed.id, log: (line) => sessionLog.info(line) })
+      if (!drifted || managed.name !== managed.autoTitle || managed.isProcessing || this.sessions.get(managed.id) !== managed) return
+      sessionLog.info(`[smart-titles] Title of session ${managed.id} no longer fits, refreshing`)
+      await this.refreshTitle(managed.id, { onlyIfName: managed.name })
+    } catch (e) {
+      sessionLog.warn(`[smart-titles] Title drift check failed for session ${managed.id}:`, e)
+    }
+  }
+
+  /**
+   * Mid-turn messages: steer or queue, as judged against the request the running turn is
+   * working on (the latest user message that is not waiting in the queue). `null` keeps the
+   * connection's configured behaviour.
+   */
+  private async decideMidTurnDelivery(managed: ManagedSession, message: string, configured: 'steer' | 'queue'): Promise<'steer' | 'queue' | null> {
+    try {
+      const runningRequest = managed.messages.findLast(m => m.role === 'user' && !m.isQueued && !m.hidden)?.content
+      const delivery = await decideMidTurnDelivery({ runningRequest, newMessage: message, configured }, {
+        sessionId: managed.id,
+        log: (line) => sessionLog.info(line),
+      })
+      if (delivery) sessionLog.info(`[mid-turn] Session ${managed.id}: ${delivery} (decision model)`)
+      return delivery
+    } catch (e) {
+      sessionLog.warn(`[mid-turn] Delivery check failed for session ${managed.id}:`, e)
+      return null
+    }
+  }
+
+  /**
+   * Mid-turn messages: judge in the background whether a newly queued plain-text message
+   * continues the plain-text message queued just before it; if the answer arrives before the
+   * replay, both are replayed as one turn (see processNextQueuedMessage). Otherwise nothing changes.
+   */
+  private async markQueuedContinuation(managed: ManagedSession, payload: ManagedSession['messageQueue'][number]): Promise<void> {
+    try {
+      const index = managed.messageQueue.indexOf(payload)
+      const previous = index > 0 ? managed.messageQueue[index - 1] : undefined
+      if (!previous || !canSteerTextPayload(previous.attachments, previous.storedAttachments, previous.options)) return
+      if (!canSteerTextPayload(payload.attachments, payload.storedAttachments, payload.options)) return
+      const same = await isContinuation(previous.message, payload.message, { sessionId: managed.id, log: (line) => sessionLog.info(line) })
+      // Both must still be waiting, in the same order, when the answer arrives.
+      const now = managed.messageQueue.indexOf(payload)
+      if (same && now > 0 && managed.messageQueue[now - 1] === previous) payload.mergeWith = previous
+    } catch (e) {
+      sessionLog.warn(`[mid-turn] Continuation check failed for session ${managed.id}:`, e)
+    }
+  }
+
+  /**
+   * Mid-turn messages: a text message sent during a turn was recorded as queued. If the model
+   * says it corrects the running work (or has no answer and the connection steers by default),
+   * move it into the turn as a steer, but only while it is still waiting in the queue, the same
+   * turn is running and the backend can take a steer without its abort fallback. Otherwise it stays
+   * queued and replays after the turn, exactly as a queued message always did.
+   *
+   * Half of a continued message is never steered: its continuation check is awaited, and a message
+   * that continues a queued one (or is continued by one) replays with it. Steering only
+   * "call it X" out of "when you create the event later," / "call it X" delivered the second
+   * half on its own, and without "later" it read as "create the event now".
+   */
+  private async steerQueuedIfDecided(
+    managed: ManagedSession,
+    payload: ManagedSession['messageQueue'][number],
+    userMessage: Message,
+    configured: 'steer' | 'queue',
+  ): Promise<void> {
+    try {
+      const generation = managed.processingGeneration
+      const [decided] = await Promise.all([
+        this.decideMidTurnDelivery(managed, payload.message, configured),
+        payload.continuationCheck,
+      ])
+      if ((decided ?? configured) !== 'steer') return
+      if (isInQueuedContinuation(managed.messageQueue, payload)) {
+        sessionLog.info('[mid-turn] Not steering part of a continued message; it replays with the rest', { sessionId: managed.id, messageId: payload.messageId })
+        return
+      }
+      const index = managed.messageQueue.indexOf(payload)
+      const agent = managed.agent
+      if (index === -1 || this.sessions.get(managed.id) !== managed || !managed.isProcessing
+        || managed.processingGeneration !== generation || !agent?.canSteerNow?.()) return
+      managed.messageQueue.splice(index, 1)
+      if (!agent.redirect(payload.message, { messageId: payload.messageId })) {
+        managed.messageQueue.splice(index, 0, payload)  // canSteerNow promised otherwise; keep it queued
+        return
+      }
+      if (agent.takePendingSteers && payload.messageId) (managed.acceptedSteers ??= new Map()).set(payload.messageId, payload)
+      ;(managed.turnSteers ??= []).push(payload.message)
+      userMessage.isQueued = false
+      sessionLog.info('mid-stream send steered after decision', { sessionId: managed.id, messageId: payload.messageId })
+      this.sendEvent({
+        type: 'user_message',
+        sessionId: managed.id,
+        message: userMessage,
+        status: 'accepted',
+        optimisticMessageId: payload.optimisticMessageId,
+      }, managed.workspace.id)
+      this.persistSession(managed)
+    } catch (e) {
+      sessionLog.warn(`[mid-turn] Steering a queued message failed for session ${managed.id}:`, e)
+    }
+  }
+
+  /** Suggestions follow-up: note the candidates a tool call or a source activation used. */
+  private noteSuggestionUse(managed: ManagedSession, call: Parameters<typeof candidatesUsedBy>[1]): void {
+    const tracked = managed.suggestionTrace
+    if (!tracked) return
+    for (const key of candidatesUsedBy(tracked.trace.candidates, call)) tracked.used.add(key)
+  }
+
+  /** Suggestions follow-up: record whether the request used the pick. Once per request. */
+  private finishSuggestionTrace(managed: ManagedSession): void {
+    const tracked = managed.suggestionTrace
+    if (!tracked) return
+    managed.suggestionTrace = undefined
+    suggestionFollowUp(tracked.trace, tracked.used)
+  }
+
+  /** Synchronous toggle check for the decision points run here (a seam for tests). */
+  private decisionFeatureActive(feature: DecisionLayerFeature): boolean {
+    return isDecisionFeatureActive(feature)
+  }
+
+  /**
+   * Decisions taken before a turn starts (toggles `adaptiveThinking` and `suggestions`). Started
+   * before agent setup so the calls overlap it; each part is `null` when off, unsure or failed.
+   */
+  private startPreTurnDecisions(
+    managed: ManagedSession,
+    message: string,
+    options?: SendMessageOptions,
+    turn: { activationResend?: boolean; authRetry?: boolean; attachments?: FileAttachment[] } = {},
+  ): Promise<{ thinkingOverride: ThinkingLevel | null; suggestionHint: string | null }> | null {
+    // An auto-retry continues the same request: keep its thinking level, ask nothing again. An
+    // auth retry re-sends the attempt the provider rejected, so it keeps that attempt's hint too.
+    if (turn.activationResend || turn.authRetry) {
+      const thinkingOverride = managed.turnThinkingOverride ?? null
+      const suggestionHint = turn.authRetry ? managed.turnSuggestionHint ?? null : null
+      return thinkingOverride || suggestionHint ? Promise.resolve({ thinkingOverride, suggestionHint }) : null
+    }
+    managed.turnThinkingOverride = null
+    managed.turnSuggestionHint = null
+    this.finishSuggestionTrace(managed)
+    // Valid only while the last reply answers that turn: any other message in between drops it.
+    const previousThinking = managed.thinkingTrace
+    managed.thinkingTrace = undefined
+    const log = (line: string) => sessionLog.info(line)
+    const interactive = !managed.hidden && managed.systemPromptPreset !== 'mini'
+    // A caller-chosen level for this turn wins and is kept for its retries (see the branch above).
+    const explicitThinking = options?.thinkingLevel ?? null
+    // Slash commands are instructions to the app, and hidden messages (background-task nudges) are
+    // the app's own: neither is a request to rate, so they run at the session level.
+    const rateThinking = !explicitThinking && interactive && !options?.hidden && !message.trim().startsWith('/') && this.decisionFeatureActive('adaptiveThinking')
+    const suggest = interactive && !managed.taskRunId && !managed.taskSlug
+      && this.decisionFeatureActive('suggestions') && wantsSuggestion(message, options)
+    // Nothing to ask: the caller skips the await entirely.
+    if (!rateThinking && !suggest) {
+      if (!explicitThinking) return null
+      managed.turnThinkingOverride = explicitThinking
+      return Promise.resolve({ thinkingOverride: explicitThinking, suggestionHint: null })
+    }
+
+    // Adaptive thinking: a lower level for a simple turn, never above the session's. It reads the
+    // message with the end of the previous reply and the attachments' names (never their content).
+    const thinking = rateThinking
+      ? pickTurnThinkingLevel({
+          message,
+          previousReply: managed.messages.findLast(m => m.role === 'assistant' && !m.isIntermediate)?.content,
+          attachments: turn.attachments?.map(a => `${a.name} (${a.type}, ${Math.max(1, Math.round(a.size / 1024))} KB)`),
+        }, managed.thinkingLevel ?? DEFAULT_THINKING_LEVEL, { sessionId: managed.id, log })
+          .then(({ level, result }) => {
+            if (previousThinking) recordThinkingFollowUp(previousThinking, result)
+            if (result) managed.thinkingTrace = result
+            if (level) sessionLog.info(`[adaptive-thinking] Session ${managed.id}: thinking ${level} for this turn`)
+            return level
+          })
+          .catch((e) => {
+            sessionLog.warn(`[adaptive-thinking] Check failed for session ${managed.id}:`, e)
+            return null
+          })
+      : Promise.resolve(explicitThinking)
+
+    // Suggestions: point the agent at a skill or usable inactive source the message plainly needs.
+    const suggestion = suggest
+      ? (async () => {
+          const workspaceRoot = managed.workspace.rootPath
+          const candidates = collectSuggestionCandidates({
+            skills: loadAllSkills(workspaceRoot, managed.workingDirectory),
+            sources: loadAllSources(workspaceRoot),
+            activeSourceSlugs: managed.enabledSourceSlugs ?? [],
+          })
+          const { hint, trace } = await pickSuggestion(message, candidates, { sessionId: managed.id, log })
+          // Kept until the request is over, to record whether the agent used the pick anyway.
+          if (trace) managed.suggestionTrace = { trace, used: new Set() }
+          if (!hint) return null
+          sessionLog.info(`[suggestions] Session ${managed.id}: suggesting ${hint.kind} "${hint.slug}"`)
+          return formatSuggestionHint(hint)
+        })().catch((e) => {
+          sessionLog.warn(`[suggestions] Check failed for session ${managed.id}:`, e)
+          return null
+        })
+      : Promise.resolve(null)
+
+    return Promise.all([thinking, suggestion]).then(([thinkingOverride, suggestionHint]) => {
+      managed.turnThinkingOverride = thinkingOverride
+      managed.turnSuggestionHint = suggestionHint
+      return { thinkingOverride, suggestionHint }
+    })
+  }
+
+  /**
+   * The task context a task's own session sends with this turn: its spec from task.yaml, once and
+   * again whenever the spec changes (`taskContextFingerprint`). The session has no messages until a
+   * run's verification, so without it "do the task" reached an agent that had never seen the goal.
+   * Subtask sessions get their prompt as their first message instead. An auth retry re-sends what
+   * the rejected attempt carried. `null` = nothing to send.
+   */
+  private takeTaskSessionContext(managed: ManagedSession, authRetry?: boolean): string | null {
+    if (authRetry) return managed.turnTaskContext ?? null
+    managed.turnTaskContext = null
+    if (!managed.taskSlug || managed.parentSessionId) return null
+    const workspaceRoot = managed.workspace.rootPath
+    let spec: TaskSpec | undefined
+    try {
+      spec = loadTaskSpec(workspaceRoot, managed.taskSlug)?.spec
+    } catch (e) {
+      sessionLog.warn(`[task-context] Could not read task "${managed.taskSlug}" for session ${managed.id}:`, e)
+    }
+    if (!spec) return null
+    const context = buildTaskSessionContext(spec, taskYamlPath(workspaceRoot, managed.taskSlug))
+    const fingerprint = createHash('sha256').update(context).digest('hex').slice(0, 16)
+    if (managed.taskContextFingerprint === fingerprint) return null
+    managed.taskContextFingerprint = fingerprint
+    managed.turnTaskContext = context
+    this.persistSession(managed)
+    sessionLog.info(`[task-context] Sending task "${managed.taskSlug}" with this turn of session ${managed.id}`)
+    return context
+  }
+
+  /**
+   * What `get_session_info` reports about a session's task: the spec's path, the subtask (DAG
+   * node) the session runs, and the task's content so another session can work on a backlog item.
+   */
+  private taskInfoForSession(session: ManagedSession): SessionTaskInfo | undefined {
+    const slug = session.taskSlug
+    if (!slug) return undefined
+    const workspaceRoot = session.workspace.rootPath
+    let spec: TaskSpec | undefined
+    try {
+      spec = loadTaskSpec(workspaceRoot, slug)?.spec
+    } catch (e) {
+      sessionLog.warn(`[task-context] Could not read task "${slug}" for session ${session.id}:`, e)
+    }
+    return {
+      slug,
+      specPath: taskYamlPath(workspaceRoot, slug),
+      ...(session.parentSessionId && session.taskNodeId ? { nodeId: session.taskNodeId } : {}),
+      ...(spec
+        ? {
+            title: spec.title,
+            goal: spec.goal,
+            ...(spec.acceptance_criteria ? { acceptanceCriteria: spec.acceptance_criteria } : {}),
+            subtasks: taskSubtasks(spec),
+          }
+        : {}),
+    }
+  }
+
+  /**
    * Centralized setter for session processing state.
    * Automatically notifies the power manager on transitions (true→false, false→true)
    * so callers don't need to remember to call onSessionStarted/onSessionStopped.
@@ -1176,10 +1915,20 @@ export class SessionManager implements ISessionManager {
     }
   }
 
-  /** Wait until initialize() has completed (sessions loaded from disk).
-   *  Resolves immediately if already initialized. */
+  /** Wait until the fast path of initialize() has completed (migrations, auth,
+   *  config watchers). Sessions may still be loading from disk in the
+   *  background — use waitForSessionsLoaded() when you need the session map.
+   *  Resolves immediately once settled. */
   waitForInit(): Promise<void> {
     return this.initGate.wait()
+  }
+
+  /** Wait until the background disk load has populated the in-memory session
+   *  map (or failed). List endpoints (getSessions, unread, badge) await this so
+   *  they never return an empty list mid-startup. Resolves immediately once
+   *  settled; rejects only if the fast-path init itself failed. */
+  waitForSessionsLoaded(): Promise<void> {
+    return this.sessionsGate.wait()
   }
 
   /**
@@ -1194,6 +1943,7 @@ export class SessionManager implements ISessionManager {
   }
 
   private browserPaneManager: IBrowserPaneManager | null = null
+  private enqueuePageThumbnailFn?: (req: { workspaceId: string; workspaceRootPath: string; slug: string }) => void
   private rpcServer: RpcServer | null = null
   private remoteBpms = new Map<string, RemoteBrowserPaneManager>()
   /** Pinned desktop client per session for `client:browser:invoke` routing. */
@@ -1207,6 +1957,24 @@ export class SessionManager implements ISessionManager {
   setBrowserPaneManager(bpm: IBrowserPaneManager): void {
     this.browserPaneManager = bpm
     bpm.setSessionPathResolver((sessionId) => this.getSessionPath(sessionId))
+  }
+
+  /**
+   * Inject the page thumbnail capturer (Electron main only — needs a
+   * BrowserWindow). Headless/WebUI hosts never call this, so
+   * {@link enqueuePageThumbnail} no-ops and tiles fall back to the placeholder.
+   */
+  setPageThumbnailer(fn: (req: { workspaceId: string; workspaceRootPath: string; slug: string }) => void): void {
+    this.enqueuePageThumbnailFn = fn
+  }
+
+  /**
+   * Request a (re)capture of a page's preview poster. Fire-and-forget: the
+   * injected capturer queues it, writes thumbnail.jpg, and stamps page.json
+   * (which broadcasts pages:changed). No-op when no capturer is injected.
+   */
+  enqueuePageThumbnail(workspaceId: string, workspaceRootPath: string, slug: string): void {
+    this.enqueuePageThumbnailFn?.({ workspaceId, workspaceRootPath, slug })
   }
 
   /**
@@ -1382,12 +2150,13 @@ export class SessionManager implements ISessionManager {
     const sessionId = managed.id
     let changed = false
 
-    // Labels
+    // Labels (canonical form: a stale writer's `bug::Bug` must not resurface)
+    const headerLabels = this.canonicalLabels(managed.workspace.rootPath, header.labels)
     const oldLabels = JSON.stringify(managed.labels ?? [])
-    const newLabels = JSON.stringify(header.labels ?? [])
+    const newLabels = JSON.stringify(headerLabels ?? [])
     if (oldLabels !== newLabels) {
-      managed.labels = header.labels
-      this.sendEvent({ type: 'labels_changed', sessionId, labels: header.labels ?? [] }, managed.workspace.id)
+      managed.labels = headerLabels
+      this.sendEvent({ type: 'labels_changed', sessionId, labels: headerLabels ?? [] }, managed.workspace.id)
       changed = true
     }
 
@@ -1412,6 +2181,18 @@ export class SessionManager implements ISessionManager {
     if (managed.name !== header.name) {
       managed.name = header.name
       this.sendEvent({ type: 'name_changed', sessionId, name: header.name }, managed.workspace.id)
+      changed = true
+    }
+
+    // Project binding (no dedicated event today — handled via metaChanged broadcast)
+    if (managed.projectId !== header.projectId) {
+      managed.projectId = header.projectId
+      changed = true
+    }
+
+    // Kanban column (mutable via drag; reconcile external/multi-window changes)
+    if (managed.kanbanColumn !== header.kanbanColumn) {
+      managed.kanbanColumn = header.kanbanColumn
       changed = true
     }
 
@@ -1486,14 +2267,24 @@ export class SessionManager implements ISessionManager {
         const automationSystem = this.automationSystems.get(workspaceRootPath)
         if (automationSystem) {
           const result = automationSystem.reloadConfig()
-          if (result.errors.length === 0) {
-            sessionLog.info(`Reloaded ${result.automationCount} automations for workspace ${workspaceId}`)
-          } else {
+          if (!result.success) {
             sessionLog.error(`Failed to reload automations for workspace ${workspaceId}:`, result.errors)
+          } else if (result.errors.length > 0) {
+            // Loaded; only these entries were skipped (invalid) or will never fire.
+            sessionLog.warn(`Reloaded ${result.automationCount} automations for workspace ${workspaceId}; some will not run:`, result.errors)
+          } else {
+            sessionLog.info(`Reloaded ${result.automationCount} automations for workspace ${workspaceId}`)
           }
         }
         // Notify renderer to re-read automations.json
         this.broadcastAutomationsChanged(workspaceId)
+      },
+      onPagesListChange: (pages) => {
+        sessionLog.info(`Pages changed in ${workspaceId} (${pages.length} pages)`)
+        // Rebuild the synthetic page-refresh cron matchers (page.json is the
+        // completion marker, so this also fires after every refresh run)
+        this.automationSystems.get(workspaceRootPath)?.reloadPageRefreshMatchers()
+        this.broadcastPagesChanged(workspaceId, pages)
       },
       onLlmConnectionsChange: () => {
         sessionLog.info(`LLM connections changed in ${workspaceId}`)
@@ -1560,7 +2351,7 @@ export class SessionManager implements ISessionManager {
         if (automationSystem) {
           automationSystem.updateSessionMetadata(sessionId, {
             permissionMode: header.permissionMode,
-            labels: header.labels,
+            labels: this.canonicalLabels(managed.workspace.rootPath, header.labels),
             isFlagged: header.isFlagged,
             sessionStatus: header.sessionStatus,
             sessionName: header.name,
@@ -1581,48 +2372,7 @@ export class SessionManager implements ISessionManager {
         workspaceRootPath,
         workspaceId,
         enableScheduler: true,
-        onPromptsReady: async (prompts) => {
-          // Execute prompt automations by creating new sessions
-          const settled = await Promise.allSettled(
-            prompts.map((pending) =>
-              this.executePromptAutomation({
-                workspaceId,
-                workspaceRootPath,
-                prompt: pending.prompt,
-                labels: pending.labels,
-                permissionMode: pending.permissionMode,
-                mentions: pending.mentions,
-                llmConnection: pending.llmConnection,
-                model: pending.model,
-                thinkingLevel: pending.thinkingLevel,
-                automationName: pending.automationName,
-                telegramTopic: pending.telegramTopic,
-              })
-            )
-          )
-
-          // Write enriched history entries (with session IDs and prompt summaries)
-          for (const [idx, result] of settled.entries()) {
-            const pending = prompts[idx]
-            if (!pending.matcherId) continue
-
-            const entry = createPromptHistoryEntry({
-              matcherId: pending.matcherId,
-              ok: result.status === 'fulfilled',
-              sessionId: result.status === 'fulfilled' ? result.value.sessionId : undefined,
-              prompt: pending.prompt,
-              error: result.status === 'rejected' ? String(result.reason) : undefined,
-            })
-
-            appendAutomationHistoryEntry(workspaceRootPath, entry).catch(e => sessionLog.warn('[Automations] Failed to write history:', e))
-
-            if (result.status === 'rejected') {
-              sessionLog.error(`[Automations] Failed to execute prompt action ${idx + 1}:`, result.reason)
-            } else {
-              sessionLog.info(`[Automations] Created session ${result.value.sessionId} from prompt action`)
-            }
-          }
-        },
+        onPromptsReady: (readyPrompts) => this.runReadyPrompts(workspaceId, workspaceRootPath, readyPrompts),
         onError: (event, error) => {
           sessionLog.error(`Automation failed for ${event}:`, error.message)
         },
@@ -1697,6 +2447,12 @@ export class SessionManager implements ISessionManager {
     this.eventSink(RPC_CHANNELS.skills.CHANGED, { to: 'workspace', workspaceId }, workspaceId, skills)
   }
 
+  private broadcastPagesChanged(workspaceId: string, pages: import('@craft-agent/shared/pages').LoadedPage[]): void {
+    if (!this.eventSink) return
+    sessionLog.info(`Broadcasting pages changed (${pages.length} pages)`)
+    this.eventSink(RPC_CHANNELS.pages.CHANGED, { to: 'workspace', workspaceId }, workspaceId, pages)
+  }
+
   private broadcastDefaultPermissionsChanged(): void {
     if (!this.eventSink) return
     sessionLog.info('Broadcasting default permissions changed')
@@ -1714,7 +2470,7 @@ export class SessionManager implements ISessionManager {
     const workspaceRootPath = managed.workspace.rootPath
     sessionLog.info(`Reloading sources for session ${managed.id}`)
 
-    // Reload all sources from disk (craft-agents-docs is always available as MCP server)
+    // Reload all sources from disk
     const allSources = loadAllSources(workspaceRootPath)
     managed.agent.setAllSources(allSources)
 
@@ -1727,9 +2483,6 @@ export class SessionManager implements ISessionManager {
     const sessionPath = getSessionStoragePath(workspaceRootPath, managed.id)
     const { mcpServers, apiServers } = await buildServersFromSources(enabledSources, sessionPath, managed.tokenRefreshManager, managed.agent?.getSummarizeCallback())
     const intendedSlugs = enabledSources.map(s => s.config.slug)
-
-    // Update bridge-mcp-server config/credentials for backends that need it
-    await applyBridgeUpdates(managed.agent, sessionPath, enabledSources, mcpServers, managed.id, workspaceRootPath, 'source reload', managed.poolServer?.url)
 
     await managed.agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
 
@@ -1744,7 +2497,7 @@ export class SessionManager implements ISessionManager {
    * Bun's automatic .env loading is disabled in the subprocess (--env-file=/dev/null)
    * to prevent a user's project .env from injecting ANTHROPIC_API_KEY and overriding
    * OAuth auth — Claude Code prioritizes API key over OAuth token when both are set.
-   * See: https://github.com/lukilabs/craft-agents-oss/issues/39
+   * See: https://github.com/craft-ai-agents/craft-agents-oss/issues/39
    */
   /**
    * Reinitialize authentication environment variables.
@@ -1755,6 +2508,11 @@ export class SessionManager implements ISessionManager {
    */
   async reinitializeAuth(connectionSlug?: string): Promise<void> {
     try {
+      // A slug means its credentials changed (SETUP: a new key or sign-in). Running agents on it
+      // keep what their postInit resolved, and a Claude agent's CLIs start with that: resolve it
+      // again. Before process.env below, which has to end on this connection.
+      if (connectionSlug) await this.reresolveAgentCredentials(connectionSlug)
+
       const manager = getCredentialManager()
 
       // Get the connection to use (explicit parameter or default)
@@ -1796,7 +2554,27 @@ export class SessionManager implements ISessionManager {
     }
   }
 
+  /**
+   * Run postInit again for the running agents on a connection, so their next title, completion or
+   * turn uses its new credentials. A keep-alive session's live CLI keeps the ones it started with
+   * until it restarts (a revoked credential ends in the auth retry, which recreates the agent).
+   */
+  private async reresolveAgentCredentials(connectionSlug: string): Promise<void> {
+    const agents = [...this.sessions.values()]
+      .filter(managed => managed.llmConnection === connectionSlug && managed.agent)
+      .map(managed => managed.agent!)
+    await Promise.all(agents.map(agent => agent.postInit().catch(error => {
+      sessionLog.warn(`Re-resolving credentials for ${connectionSlug} failed:`, error)
+    })))
+  }
+
   async initialize(): Promise<void> {
+    // Large tool results (decision model, toggle `largeResults`): the process-wide filter keeps the
+    // parts the agent's intent needs instead of a summary; it no-ops while the toggle is off.
+    setLargeResultFilter(buildLargeResultFilter({ log: (line) => sessionLog.info(line) }))
+    // Guarded mode behaves as Ask while its risk check cannot run (decision layer or feature off).
+    setGuardedModeActiveResolver(() => isDecisionFeatureActive('guardedMode'))
+
     try {
       // Backfill missing `models` arrays on existing LLM connections
       migrateLegacyLlmConnectionsConfig()
@@ -1820,79 +2598,137 @@ export class SessionManager implements ISessionManager {
         this.setupConfigWatcher(workspace.rootPath, workspace.id)
       }
 
-      // Load existing sessions from disk
-      this.loadSessionsFromDisk()
-
-      // Signal that initialization is complete — IPC handlers waiting on initGate will proceed
+      // Signal fast-path readiness so the first window can open immediately.
+      // Session discovery (disk I/O that can block on cloud-evicted files) runs
+      // in the background behind sessionsGate — see loadSessionsFromDiskAsync.
       this.initGate.markReady()
+
+      // Load existing sessions from disk off the critical path. Fire-and-forget:
+      // it settles sessionsGate (ready) on its own; list handlers await that.
+      void this.loadSessionsFromDiskAsync()
     } catch (error) {
       this.initGate.markFailed(error)
+      // The background load never starts on a fast-path failure, so settle its
+      // gate here too — otherwise list handlers would hang forever.
+      this.sessionsGate.markFailed(error)
       throw error
     }
   }
 
-  // Load all existing sessions from disk into memory (metadata only - messages are lazy-loaded)
-  private loadSessionsFromDisk(): void {
+  /**
+   * Load all existing sessions from disk into memory (metadata only — messages
+   * are lazy-loaded). Runs off the critical path so a cloud-evicted session file
+   * can't block the first window (craft-agents#1113): listStoredSessionsAsync
+   * reads headers on the libuv threadpool and skips offloaded/unreadable files.
+   * Settles sessionsGate in `finally` so list handlers (getSessions, unread,
+   * badge) resolve against a populated map even if a workspace fails.
+   */
+  private async loadSessionsFromDiskAsync(): Promise<void> {
     try {
       const workspaces = getWorkspaces()
       let totalSessions = 0
-
-      // Iterate over each workspace and load its sessions
       for (const workspace of workspaces) {
-        const workspaceRootPath = workspace.rootPath
-        const sessionMetadata = listStoredSessions(workspaceRootPath)
-        // Load workspace config once per workspace for default working directory
-        const wsConfig = loadWorkspaceConfig(workspaceRootPath)
-        const wsDefaultWorkingDir = wsConfig?.defaults?.workingDirectory
+        totalSessions += this.ingestWorkspaceSessions(workspace, await listStoredSessionsAsync(workspace.rootPath))
+      }
+      sessionLog.info(`Loaded ${totalSessions} sessions from disk (metadata only, async)`)
+    } catch (error) {
+      sessionLog.error('Failed to load sessions from disk (async):', error)
+    } finally {
+      // Idempotent: no-op if initialize() already markFailed'd on a fast-path error.
+      this.sessionsGate.markReady()
+    }
+  }
 
-        for (const meta of sessionMetadata) {
-          // Create managed session from metadata only (messages lazy-loaded on demand)
-          // This dramatically reduces memory usage at startup - messages are loaded
-          // when getSession() is called for a specific session
-          const managed = createManagedSession(meta, workspace, {
-            enabledSourceSlugs: undefined,  // Loaded with messages
-            workingDirectory: meta.workingDirectory ?? wsDefaultWorkingDir,
-          })
+  /**
+   * Hydrate in-memory ManagedSessions from one workspace's on-disk session
+   * metadata. Called per workspace by loadSessionsFromDiskAsync. Returns the
+   * number of sessions ingested.
+   */
+  private ingestWorkspaceSessions(workspace: Workspace, sessionMetadata: SessionMetadata[]): number {
+    const workspaceRootPath = workspace.rootPath
+    // Load workspace config once per workspace for default working directory
+    const wsConfig = loadWorkspaceConfig(workspaceRootPath)
+    const wsDefaultWorkingDir = wsConfig?.defaults?.workingDirectory
+    // Label tree once per workspace: stored labels are read in canonical form (canonicalLabels)
+    let labelTree: LabelConfig[] | undefined
+    try { labelTree = listLabels(workspaceRootPath) } catch (e) { sessionLog.warn(`Could not read labels for ${workspaceRootPath}:`, e) }
 
-          // Migration: clear orphaned llmConnection references (e.g., after connection was deleted)
-          if (managed.llmConnection) {
-            const conn = resolveSessionConnection(managed.llmConnection, undefined)
-            if (!conn) {
-              sessionLog.warn(`Session ${meta.id} has orphaned llmConnection "${managed.llmConnection}", clearing`)
-              managed.llmConnection = undefined
-              managed.connectionLocked = false
-            }
-          }
+    let count = 0
+    for (const meta of sessionMetadata) {
+      // Create managed session from metadata only (messages lazy-loaded on demand)
+      // This dramatically reduces memory usage at startup - messages are loaded
+      // when getSession() is called for a specific session
+      const managed = createManagedSession(meta, workspace, {
+        // The header carries the session's explicit source selection (persisted at
+        // creation / by setSessionSources). Seed it now so the renderer's very first
+        // session list shows the right chips — sessions without one hydrate any legacy
+        // body value on message load (see hydrateMessagesForColdPersist).
+        enabledSourceSlugs: meta.enabledSourceSlugs,
+        workingDirectory: meta.workingDirectory ?? wsDefaultWorkingDir,
+      })
 
-          // Initialize mode-manager state for restored sessions even before agent creation.
-          // This keeps diagnostics/effective mode aligned with persisted session metadata.
-          setPermissionMode(meta.id, managed.permissionMode ?? 'ask', { changedBy: 'restore' })
-          if (managed.previousPermissionMode) {
-            hydratePreviousPermissionMode(meta.id, managed.previousPermissionMode)
-          }
+      // Older auto-labelling stored values on plain labels (`bug::bug`, `bug::Bug`) and empty values
+      // (`trip::`). Read them in canonical form before the automation snapshot below, so the cleanup
+      // fires no label events; the canonical list reaches disk with the session's next save.
+      if (labelTree) managed.labels = this.canonicalLabels(workspaceRootPath, managed.labels, labelTree)
 
-          this.sessions.set(meta.id, managed)
-
-          // Initialize session metadata in AutomationSystem for diffing
-          const automationSystem = this.automationSystems.get(workspaceRootPath)
-          if (automationSystem) {
-            automationSystem.setInitialSessionMetadata(meta.id, {
-              permissionMode: meta.permissionMode,
-              labels: meta.labels,
-              isFlagged: meta.isFlagged,
-              sessionStatus: meta.sessionStatus,
-              sessionName: managed.name,
-            })
-          }
-
-          totalSessions++
+      // Migration: clear orphaned llmConnection references (e.g., after connection was deleted)
+      if (managed.llmConnection) {
+        const conn = resolveSessionConnection(managed.llmConnection, undefined)
+        if (!conn) {
+          sessionLog.warn(`Session ${meta.id} has orphaned llmConnection "${managed.llmConnection}", clearing`)
+          managed.llmConnection = undefined
+          managed.connectionLocked = false
         }
       }
 
-      sessionLog.info(`Loaded ${totalSessions} sessions from disk (metadata only)`)
-    } catch (error) {
-      sessionLog.error('Failed to load sessions from disk:', error)
+      // Initialize mode-manager state for restored sessions even before agent creation.
+      // This keeps diagnostics/effective mode aligned with persisted session metadata.
+      setPermissionMode(meta.id, managed.permissionMode ?? 'ask', { changedBy: 'restore' })
+      if (managed.previousPermissionMode) {
+        hydratePreviousPermissionMode(meta.id, managed.previousPermissionMode)
+      }
+
+      this.sessions.set(meta.id, managed)
+
+      // Initialize session metadata in AutomationSystem for diffing
+      const automationSystem = this.automationSystems.get(workspaceRootPath)
+      if (automationSystem) {
+        automationSystem.setInitialSessionMetadata(meta.id, {
+          permissionMode: meta.permissionMode,
+          labels: managed.labels,
+          isFlagged: meta.isFlagged,
+          sessionStatus: meta.sessionStatus,
+          sessionName: managed.name,
+        })
+      }
+
+      count++
     }
+    return count
+  }
+
+  /**
+   * A session's labels in canonical form for its workspace's label tree (canonicalizeSessionLabels):
+   * how every label list read from disk or handed in by a writer is stored, so older auto-labelling's
+   * `bug::bug` / `bug::Bug` / `trip::` read as `bug` / `trip` and duplicates never reach the UI,
+   * automations or agents. Unchanged when the label config can't be read.
+   */
+  private canonicalLabels(workspaceRootPath: string, labels: string[] | undefined, labelTree?: LabelConfig[]): string[] | undefined {
+    if (!labels?.length) return labels
+    try {
+      return canonicalizeSessionLabels(labels, labelTree ?? listLabels(workspaceRootPath))
+    } catch (e) {
+      sessionLog.warn('Could not canonicalize session labels:', e)
+      return labels
+    }
+  }
+
+  /** The session a branch was forked from: live in memory, else its header on disk. */
+  private branchParent(managed: ManagedSession): BranchParent | null {
+    if (!managed.branchFromSessionPath) return null
+    const parentId = basename(managed.branchFromSessionPath)
+    return this.sessions.get(parentId) ?? readSessionHeader(getSessionFilePath(managed.workspace.rootPath, parentId))
   }
 
   // Suppress fs.watch metadata-revert events for the window in which our own
@@ -1931,8 +2767,9 @@ export class SessionManager implements ISessionManager {
     if (stored) {
       managed.messages = (stored.messages || []).map(storedToMessage)
       managed.tokenUsage = stored.tokenUsage
+      managed.pendingPlanExecution = stored.pendingPlanExecution
       // Deferred-load fields (intentionally undefined after startup, see
-      // loadSessionsFromDisk). Populate from disk only if not already set in
+      // ingestWorkspaceSessions). Populate from disk only if not already set in
       // memory — a caller may have mutated them via setSessionSources etc.
       if (managed.enabledSourceSlugs === undefined) managed.enabledSourceSlugs = stored.enabledSourceSlugs
       if (managed.lastReadMessageId === undefined) managed.lastReadMessageId = stored.lastReadMessageId
@@ -2105,26 +2942,52 @@ export class SessionManager implements ISessionManager {
     // Persist session with updated auth message and enabled sources
     this.persistSession(managed)
 
-    // Update bridge-mcp-server config/credentials for backends that need it
-    if (result.success && result.sourceSlug && managed.agent) {
-      const workspaceRootPath = managed.workspace.rootPath
-      const sessionPath = getSessionStoragePath(workspaceRootPath, managed.id)
-      const enabledSlugs = managed.enabledSourceSlugs || []
-      const allSources = loadAllSources(workspaceRootPath)
-      const enabledSources = allSources.filter(s =>
-        enabledSlugs.includes(s.config.slug) && isSourceUsable(s)
-      )
-      const { mcpServers } = await buildServersFromSources(
-        enabledSources, sessionPath, managed.tokenRefreshManager
-      )
-      await applyBridgeUpdates(managed.agent, sessionPath, enabledSources, mcpServers, managed.id, workspaceRootPath, 'source auth', managed.poolServer?.url)
-    }
-
     // Send the result as a new message to resume conversation
     // Use empty arrays for attachments since this is a system-generated message
     await this.sendMessage(sessionId, resultContent, [], [], {})
 
     sessionLog.info(`Auth request completed for ${result.sourceSlug}: ${result.success ? 'success' : 'failed'}`)
+  }
+
+  /**
+   * One OAuth sign-in serves every session paused on the source: complete each session's
+   * pending OAuth request for it in this workspace and resume it. `boundRequests` (the cards
+   * that started or joined the sign-in) also count when their session no longer holds the
+   * request in memory — `pendingAuthRequest` is not persisted, so a restart forgets it.
+   * Resumed turns run in the background so sessions don't wait on each other's turns.
+   */
+  completeAuthRequestsForSource(
+    workspaceId: string,
+    sourceSlug: string,
+    result: { email?: string; workspace?: string },
+    boundRequests: Array<{ sessionId: string; authRequestId: string }> = [],
+  ): string[] {
+    const bound = new Map(boundRequests.map(r => [r.sessionId, r.authRequestId]))
+    const resumed: string[] = []
+    for (const managed of this.sessions.values()) {
+      if (managed.workspace.id !== workspaceId) continue
+      // The fresh tokens void any refresh-failure cooldown, whether or not the session was waiting
+      managed.tokenRefreshManager.clearCooldown(sourceSlug)
+
+      let requestId: string | undefined
+      const pending = managed.pendingAuthRequest
+      if (pending) {
+        // A session holds one request at a time; answer it only if it is this source's sign-in
+        if (pending.type !== 'credential' && pending.sourceSlug === sourceSlug) requestId = pending.requestId
+      } else {
+        const boundId = bound.get(managed.id)
+        if (boundId && managed.messages.some(m =>
+          m.role === 'auth-request' && m.authRequestId === boundId && m.authStatus === 'pending')) {
+          requestId = boundId
+        }
+      }
+      if (!requestId) continue
+
+      resumed.push(managed.id)
+      this.completeAuthRequest(managed.id, { requestId, sourceSlug, success: true, ...result })
+        .catch(error => sessionLog.error(`Failed to resume session ${managed.id} after ${sourceSlug} sign-in:`, error))
+    }
+    return resumed
   }
 
   /**
@@ -2176,10 +3039,12 @@ export class SessionManager implements ISessionManager {
           { value: response.value! }
         )
       } else if (request.mode === 'multi-header') {
-        // Store multi-header credentials as JSON { "DD-API-KEY": "...", "DD-APPLICATION-KEY": "..." }
+        // Store multi-header credentials as JSON { "DD-API-KEY": "...", "DD-APPLICATION-KEY": "..." }.
+        // A single header matching the source's headerName is stored bare so it never
+        // reaches the wire as a serialized object (#1067).
         await credManager.set(
           { type: 'source_apikey', workspaceId: wsId, sourceId: request.sourceSlug },
-          { value: JSON.stringify(response.headers) }
+          { value: serializeHeaderCredential(response.headers ?? {}, request.headerName) }
         )
       } else {
         // header or query - both use API key storage
@@ -2274,14 +3139,6 @@ export class SessionManager implements ISessionManager {
       })
     }
     return result
-  }
-
-  /**
-   * Reload all sessions from disk.
-   * Used after importing sessions to refresh the in-memory session list.
-   */
-  reloadSessions(): void {
-    this.loadSessionsFromDisk()
   }
 
   getSessions(workspaceId?: string): Session[] {
@@ -2403,6 +3260,7 @@ export class SessionManager implements ISessionManager {
     if (storedSession) {
       managed.messages = (storedSession.messages || []).map(storedToMessage)
       managed.tokenUsage = storedSession.tokenUsage
+      managed.pendingPlanExecution = storedSession.pendingPlanExecution
       managed.lastReadMessageId = storedSession.lastReadMessageId
       managed.hasUnread = storedSession.hasUnread  // Explicit unread flag for NEW badge state machine
       managed.enabledSourceSlugs = storedSession.enabledSourceSlugs
@@ -2458,7 +3316,15 @@ export class SessionManager implements ISessionManager {
     return getSessionStoragePath(managed.workspace.rootPath, sessionId)
   }
 
-  async createSession(workspaceId: string, options?: import('@craft-agent/shared/protocol').CreateSessionOptions): Promise<Session> {
+  async createSession(
+    workspaceId: string,
+    options?: import('@craft-agent/shared/protocol').CreateSessionOptions,
+    // Transport concern, deliberately NOT on the wire DTO: by default every created session is
+    // announced to the renderer (see notifySessionCreated). Callers that register the session
+    // themselves — the `sessions:create` RPC adds it from the return value — pass
+    // `{ emitCreatedEvent: false }` to avoid a redundant hydrate.
+    internal?: { emitCreatedEvent?: boolean },
+  ): Promise<Session> {
     const workspace = getWorkspaceByNameOrId(workspaceId)
     if (!workspace) {
       throw new Error(`Workspace ${workspaceId} not found`)
@@ -2471,7 +3337,13 @@ export class SessionManager implements ISessionManager {
     const globalDefaults = loadConfigDefaults()
 
     // Read permission mode from workspace config, fallback to global defaults
-    const defaultPermissionMode = options?.permissionMode
+    // Callers may pass canonical names (`craft run --mode execute`); an unknown mode would
+    // otherwise fall through to Explore's checks, so it is rejected.
+    const requestedPermissionMode = options?.permissionMode ? parsePermissionMode(options.permissionMode) : undefined
+    if (options?.permissionMode && !requestedPermissionMode) {
+      throw new Error(`Invalid permission mode: ${String(options.permissionMode)}. Valid values: explore, ask, guarded, execute`)
+    }
+    const defaultPermissionMode = requestedPermissionMode
       ?? wsConfig?.defaults?.permissionMode
       ?? globalDefaults.workspaceDefaults.permissionMode
 
@@ -2529,8 +3401,44 @@ export class SessionManager implements ISessionManager {
       resolvedWorkingDir = options.workingDirectory
     }
 
+    // Resolve project binding. When a projectId is provided and the project has a
+    // workingDirectory configured, inherit it (only when the caller didn't pass an
+    // explicit override). This lets "+ New session in {project}" reuse the project's
+    // bound directory without duplicating logic on the renderer side.
+    // Subtasks and branches inherit their parent's / source's project when the caller didn't
+    // bind one explicitly — a child of a project-bound task belongs to that project (board
+    // quick-add passes none), and so does a branch, so project-scoped filtering sees the whole
+    // family.
+    const inheritFromSessionId = options?.parentSessionId ?? options?.branchFromSessionId
+    const inheritedProjectId = inheritFromSessionId
+      ? this.sessions.get(inheritFromSessionId)?.projectId
+      : undefined
+    const requestedProjectId = options?.projectId ?? inheritedProjectId
+    let resolvedProjectId: string | undefined
+    if (requestedProjectId) {
+      const { loadProjectById } = await import('@craft-agent/shared/projects')
+      const project = loadProjectById(workspaceRootPath, requestedProjectId)
+      if (!project) {
+        // An EXPLICIT binding to a missing project is a caller bug; an inherited one
+        // (parent's project deleted since) just no-ops rather than failing the child.
+        if (options?.projectId) {
+          throw new Error(`Project ${options.projectId} not found in workspace ${workspaceId}`)
+        }
+      } else {
+        resolvedProjectId = project.config.id
+        if (
+          (options?.workingDirectory === undefined || options?.workingDirectory === 'user_default') &&
+          project.config.workingDirectory
+        ) {
+          resolvedWorkingDir = project.config.workingDirectory
+        }
+      }
+    }
+
     // Validate branch request up-front so branch metadata is only set for valid branches.
     // This prevents creating sessions that claim to be branched but don't have copied history.
+    // A branch keeps its parent's coding mode: an SDK fork carries the parent's pinned system prompt.
+    let branchSourceCodingMode: boolean | undefined
     let validatedBranch: {
       sourceSessionId: string
       sourceMessageId: string
@@ -2572,6 +3480,7 @@ export class SessionManager implements ISessionManager {
       }
 
       const sourceSession = loadStoredSession(workspaceRootPath, options.branchFromSessionId)
+      branchSourceCodingMode = sourceManaged?.codingMode ?? sourceSession?.codingMode
       if (!sourceSession) {
         sessionLog.warn('Branch validation failed: source session not found on disk', {
           workspaceId,
@@ -2725,8 +3634,19 @@ export class SessionManager implements ISessionManager {
       workingDirectory: resolvedWorkingDir,
       hidden: options?.hidden,
       sessionStatus: options?.sessionStatus,
-      labels: options?.labels,
+      // Automations, spawn_session and task flows hand in labels unvalidated: store them canonical
+      labels: this.canonicalLabels(workspaceRootPath, options?.labels),
       isFlagged: options?.isFlagged,
+      projectId: resolvedProjectId,
+      parentSessionId: options?.parentSessionId,
+      taskSlug: options?.taskSlug,
+      taskRunId: options?.taskRunId,
+      taskNodeId: options?.taskNodeId,
+      taskDraft: options?.taskDraft,
+      // Persist only an EXPLICIT selection (e.g. a task's spec.sources on its subtasks).
+      // The workspace-default fallback stays dynamic — freezing it into the header would
+      // pin every ordinary session to the defaults as of its creation time.
+      enabledSourceSlugs: options?.enabledSourceSlugs,
     })
 
     // Branch: copy messages from source session up to and including the branch point
@@ -2810,6 +3730,8 @@ export class SessionManager implements ISessionManager {
       model: resolvedModel,
       llmConnection: options?.llmConnection,
       thinkingLevel: defaultThinkingLevel,
+      // Coding mode: branch source → caller → workspace default. Stored only when on, so default sessions stay unchanged.
+      codingMode: (validatedBranch ? branchSourceCodingMode : options?.codingMode ?? wsConfig?.defaults?.codingMode) || undefined,
       systemPromptPreset: options?.systemPromptPreset,
       enabledSourceSlugs: defaultEnabledSourceSlugs,
       branchFromMessageId: validatedBranch?.sourceMessageId,
@@ -2821,6 +3743,7 @@ export class SessionManager implements ISessionManager {
       branchSeedApplied: validatedBranch ? validatedBranch.branchContextStrategy === 'sdk-fork' : undefined,
       messagesLoaded: !isBranch,  // Branched sessions: lazy-load messages from JSONL
     })
+    if (options?.unattended) managed.unattended = true
 
     // Eagerly load messages for branched sessions so the renderer gets the full
     // conversation immediately (needed for scroll-to-bottom on panel open)
@@ -2889,11 +3812,58 @@ export class SessionManager implements ISessionManager {
       })
     }
 
+    // Reserved "Task" label: task flows opt in so the tile (and its subtasks, which inherit the
+    // parent's number) are filterable as tasks from the moment they exist. Applied before the
+    // created-event so the renderer hydrates the label with the rest of the metadata. Fail-soft:
+    // a label problem must never abort session creation.
+    if (options?.applyTaskLabel) {
+      try {
+        await this.applyTaskLabel(storedSession.id, { parentSessionId: options?.parentSessionId })
+      } catch (error) {
+        sessionLog.warn('Failed to apply Task label to new session', {
+          sessionId: storedSession.id,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    // Announce by default so the renderer hydrates full metadata (name, parentSessionId, …)
+    // instead of fabricating a titleless "New Chat" from the first streamed event. Emitted at
+    // the very end so a thrown branch-preflight failure above never announces an orphan.
+    if (internal?.emitCreatedEvent !== false) {
+      this.notifySessionCreated(workspaceId, storedSession.id)
+    }
+
     return managedToSession(managed, isBranch ? { messages: managed.messages } : undefined)
+  }
+
+  /**
+   * Announce a session to the renderer so it hydrates full metadata (name, parentSessionId, …)
+   * instead of fabricating a "New Chat" placeholder from the first streamed event.
+   *
+   * `createSession` calls this by default, so server-side creators get it for free. Use it
+   * directly only for sessions built outside `createSession` (e.g. the SessionBundle import
+   * path, which assembles a ManagedSession by hand). The renderer handler is idempotent.
+   */
+  notifySessionCreated(workspaceId: string, sessionId: string): void {
+    this.sendEvent({ type: 'session_created', sessionId }, workspaceId)
+  }
+
+  /** Resolved working directory of a live session (used by the Tasks Conductor so child
+   *  sessions inherit the orchestrator's cwd). Undefined if the session has none or is unknown. */
+  getSessionWorkingDirectory(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.workingDirectory
+  }
+
+  /** Parent of a live sub-session (the Tasks Conductor refuses to run on one). Undefined if the
+   *  session is top-level or unknown. */
+  getSessionParentId(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.parentSessionId
   }
 
   private async disposeManagedAgentRuntime(managed: ManagedSession, reason: string): Promise<void> {
     const sessionId = managed.id
+    this.recoverPendingSteers(managed)
 
     if (managed.agent) {
       try {
@@ -3223,6 +4193,7 @@ export class SessionManager implements ISessionManager {
         llmConnection: managed.llmConnection,
         permissionMode: managed.permissionMode,
         previousPermissionMode: managed.previousPermissionMode,
+        projectId: managed.projectId,
       }
 
       const onSdkSessionIdUpdate = (sdkSessionId: string) => {
@@ -3230,6 +4201,8 @@ export class SessionManager implements ISessionManager {
         // Retire branch-only fork metadata now that child session is established
         if (managed.branchFromSdkSessionId) {
           sessionLog.info(`Branch fork established for ${managed.id}: child=${sdkSessionId}, retiring parent fork metadata (parent=${managed.branchFromSdkSessionId})`)
+          const startTotals = branchStartTotals(this.branchParent(managed), managed.branchFromSdkSessionId)
+          if (startTotals) managed.tokenUsage = { ...(managed.tokenUsage ?? DEFAULT_TOKEN_USAGE), lastRunningTotals: startTotals }
           managed.branchFromSdkSessionId = undefined
           managed.branchFromSdkCwd = undefined
           managed.branchFromSdkTurnId = undefined
@@ -3347,8 +4320,10 @@ export class SessionManager implements ISessionManager {
         skipConfigWatcher: true, // Server owns workspace-level ConfigWatcher — don't duplicate in agents
         automationSystem: this.automationSystems.get(managed.workspace.rootPath),
         systemPromptPreset: managed.systemPromptPreset,
+        agentProfile: managed.codingMode ? 'coding' : undefined,
         debugMode: _platform?.isDebugMode ? { enabled: true, logFilePath: _platform.getLogFilePath?.() } : undefined,
         enable1MContext: await (async () => { const { getEnable1MContext } = await import('@craft-agent/shared/config/storage'); return getEnable1MContext(); })(),
+        autoCompactWindow: await (async () => { const { getAutoCompactWindow } = await import('@craft-agent/shared/config/storage'); return getAutoCompactWindow(); })(),
         // Image resize callback — prevents oversized images from entering conversation history
         onImageResize: async (filePath: string, maxSizeBytes: number): Promise<string | null> => {
           try {
@@ -3758,6 +4733,21 @@ export class SessionManager implements ISessionManager {
       managed.agentReadyResolve?.()
 
       // Set up permission handler to forward requests to renderer
+      // Guarded-mode risk check (decision model, toggle `guardedMode`), used only while the
+      // session is in Guarded mode. Only sessions with someone to answer a prompt are checked:
+      // automations, task runs and hidden/mini sessions run unattended, so they run as Execute.
+      managed.agent.guardedModeCheck = buildGuardedModeCheck({
+        sessionId: managed.id,
+        log: (line) => sessionLog.info(line),
+        isInteractive: () => isAttendedSession(managed),
+      })
+      // Subagent model choice (decision model, toggle `subagentModels`): the Claude agent asks it
+      // for Agent calls that name no model; no answer leaves the Settings default in charge.
+      managed.agent.subagentModelPicker = buildSubagentModelPicker({
+        sessionId: managed.id,
+        log: (line) => sessionLog.info(line),
+      })
+
       managed.agent.onPermissionRequest = (request: {
         requestId: string;
         toolName: string;
@@ -3771,6 +4761,7 @@ export class SessionManager implements ISessionManager {
         rememberForMinutes?: number;
         commandHash?: string;
         approvalTtlSeconds?: number;
+        canRemember?: boolean;
       }) => {
         sessionLog.info(`Permission request for session ${managed.id}:`, request.command)
         let brokerMetadata: {
@@ -3825,15 +4816,48 @@ export class SessionManager implements ISessionManager {
           sessionLog.warn(`Remember-window auto-approval skipped for ${request.requestId}: ${brokerResult.reason}`)
         }
 
-        this.sendEvent({
-          type: 'permission_request',
-          sessionId: managed.id,
-          request: {
-            ...request,
-            ...brokerMetadata,
+        const emitPrompt = (risks?: PermissionRisk[] | null) => {
+          this.sendEvent({
+            type: 'permission_request',
             sessionId: managed.id,
-          }
-        }, managed.workspace.id)
+            request: {
+              ...request,
+              ...brokerMetadata,
+              ...(risks && risks.length > 0 ? { risks } : {}),
+              sessionId: managed.id,
+            }
+          }, managed.workspace.id)
+        }
+
+        // Admin prompts already explain reason and impact; everything else may get risk badges
+        // from the decision model (toggle `riskBadges`). The prompt waits for them (bounded by the
+        // background deadline). It is dropped if, meanwhile, the request was answered, the session
+        // was stopped or deleted, or the agent was rebuilt; the agent side is then denied so nothing
+        // waits on it. A new turn alone does not drop it: keep-alive background agents still wait.
+        if (request.type === 'admin_approval' || !this.decisionFeatureActive('riskBadges')) {
+          emitPrompt()
+        } else {
+          const askedIn = { agent: managed.agent, stopEpoch: managed.stopEpoch ?? 0 }
+          void assessPermissionRisks(
+            { toolName: request.toolName, description: request.description, command: request.command },
+            { sessionId: managed.id, log: (line) => sessionLog.info(line) },
+          ).catch(() => null).then((risks) => {
+            if (!this.pendingPermissionRequests.has(request.requestId)) return
+            const stale = managed.agent !== askedIn.agent || (managed.stopEpoch ?? 0) !== askedIn.stopEpoch
+              || this.sessions.get(managed.id) !== managed
+            if (stale) {
+              this.pendingPermissionRequests.delete(request.requestId)
+              try {
+                askedIn.agent?.respondToPermission(request.requestId, false, false)
+              } catch (e) {
+                sessionLog.warn(`Denying dropped permission request ${request.requestId} failed:`, e)
+              }
+              sessionLog.info(`Permission request ${request.requestId} dropped: stopped or rebuilt while risk badges were computed`)
+              return
+            }
+            emitPrompt(risks)
+          })
+        }
       }
 
       // Note: Credential requests now flow through onAuthRequest (unified auth flow)
@@ -3913,6 +4937,7 @@ export class SessionManager implements ISessionManager {
           if (managed.isProcessing && managed.agent) {
             sessionLog.info(`Interrupting for plan submission in session ${managed.id}`)
             managed.agent.interruptForHandoff(AbortReason.PlanSubmitted)
+            this.recoverPendingSteers(managed)
             this.setProcessing(managed, false)
 
             // Release browser overlay + session binding because the agent is no longer running.
@@ -3923,7 +4948,7 @@ export class SessionManager implements ISessionManager {
             )
 
             // Send complete event so renderer knows processing stopped (include tokenUsage for real-time updates)
-            this.sendEvent({ type: 'complete', sessionId: managed.id, tokenUsage: managed.tokenUsage }, managed.workspace.id)
+            this.sendEvent({ type: 'complete', sessionId: managed.id, tokenUsage: managed.tokenUsage, backgroundTasksAlive: this.keepBackgroundTasksAlive }, managed.workspace.id)
 
             // Persist session state
             this.persistSession(managed)
@@ -3972,6 +4997,7 @@ export class SessionManager implements ISessionManager {
         if (managed.isProcessing && managed.agent) {
           sessionLog.info(`Interrupting for auth request in session ${managed.id}`)
           managed.agent.interruptForHandoff(AbortReason.AuthRequest)
+          this.recoverPendingSteers(managed)
           this.setProcessing(managed, false)
 
           // Release browser overlay + session binding because the agent is paused awaiting user auth.
@@ -3981,7 +5007,7 @@ export class SessionManager implements ISessionManager {
           )
 
           // Send complete event so renderer knows processing stopped (include tokenUsage for real-time updates)
-          this.sendEvent({ type: 'complete', sessionId: managed.id, tokenUsage: managed.tokenUsage }, managed.workspace.id)
+          this.sendEvent({ type: 'complete', sessionId: managed.id, tokenUsage: managed.tokenUsage, backgroundTasksAlive: this.keepBackgroundTasksAlive }, managed.workspace.id)
         }
 
         // Emit auth_request event to renderer
@@ -4003,15 +5029,20 @@ export class SessionManager implements ISessionManager {
       managed.agent.onSpawnSession = async (request) => {
         sessionLog.info(`Spawn session request from session ${managed.id}:`, request.name || '(unnamed)')
 
+        // The model picks the child's mode; it may be as strict as it likes but never looser
+        // than this session's effective mode, or an Ask session could spawn an Execute child
+        // without a prompt.
+        const parentMode = getPermissionMode(managed.id)
+        const permissionMode = clampPermissionMode(request.permissionMode, parentMode)
+        if (request.permissionMode && permissionMode !== request.permissionMode) {
+          sessionLog.warn(`Spawn session: lowered requested mode ${request.permissionMode} to ${permissionMode} (parent ${managed.id} runs in ${parentMode})`)
+        }
+
         const session = await this.createSession(managed.workspace.id, {
-          name: request.name,
-          llmConnection: request.llmConnection ?? managed.llmConnection,
-          model: request.model ?? managed.model,
-          enabledSourceSlugs: request.enabledSourceSlugs ?? managed.enabledSourceSlugs,
-          permissionMode: request.permissionMode ?? managed.permissionMode,
-          thinkingLevel: request.thinkingLevel ?? managed.thinkingLevel,
-          labels: request.labels ?? managed.labels,
-          workingDirectory: request.workingDirectory,
+          ...spawnedSessionOptions(request, managed),
+          permissionMode,
+          // Nobody watches a session an automation, task or CLI run spawns either.
+          unattended: !isAttendedSession(managed) || undefined,
         })
 
         // Build FileAttachment[] from paths (if any)
@@ -4038,10 +5069,7 @@ export class SessionManager implements ISessionManager {
           if (attachments.length > 0) fileAttachments = attachments
         }
 
-        // Notify renderer to hydrate full session metadata (including name)
-        // before streaming events arrive. Without this, the renderer creates
-        // a synthetic empty session and shows "New Chat" in the sidebar.
-        this.sendEvent({ type: 'session_created', sessionId: session.id }, managed.workspace.id)
+        // (session_created is emitted by createSession above.)
 
         // Fire and forget — send the message but don't await completion
         this.sendMessage(session.id, request.prompt, fileAttachments).catch(err => {
@@ -4065,6 +5093,131 @@ export class SessionManager implements ISessionManager {
         setSessionStatusFn: async (sessionId: string | undefined, status: string) => {
           await this.setSessionStatus(sessionId ?? managed.id, status as SessionStatus)
         },
+        // archive_session — archive/unarchive ANOTHER session by ID. Scoped to the
+        // invoking session's workspace and blocked mid-turn (guard logic lives in
+        // archive-guards.ts so it is unit-testable); delegates to the existing
+        // archive/unarchive methods (which persist + emit events).
+        archiveSessionFn: async (sessionId: string, archived: boolean) => {
+          const target = this.sessions.get(sessionId)
+          const guardError = validateArchiveTarget(
+            target ? { workspaceId: target.workspace.id, isProcessing: target.isProcessing } : undefined,
+            managed.workspace.id,
+            sessionId,
+            archived
+          )
+          if (guardError) throw new Error(guardError)
+          if (archived) {
+            await this.archiveSession(sessionId)
+          } else {
+            await this.unarchiveSession(sessionId)
+          }
+        },
+        // create_task — create a Task (board card + task.yaml + orchestrator session)
+        // WITHOUT running it. Spec building happens here (not in session-tools-core,
+        // which must stay dependency-free of @craft-agent/shared); the creation flow
+        // itself is createTaskFromSpec, shared verbatim with the tasks:create RPC.
+        createTaskFn: async (input) => {
+          const ws = managed.workspace
+          // Match spawn_session: an explicit project wins, otherwise keep newly
+          // captured work in the project that owns the invoking session.
+          const projectId = resolveCreateTaskProjectId(input.projectId, managed.projectId)
+          // Slug is derived from the title and must never overwrite an existing task
+          // (unlike the TaskEditor, where re-saving the same slug is the edit flow).
+          const slug = uniqueTaskSlug(input.title, new Set(listTaskSlugs(ws.rootPath)))
+
+          // Fail-soft reference checks: unknown slugs warn, they don't block creation
+          // (matching the finish() philosophy in the tasks:create handler).
+          const warnings: string[] = []
+          if (input.sources?.length) {
+            const available = new Set(loadWorkspaceSources(ws.rootPath).map(s => s.config.slug))
+            const missing = input.sources.filter(s => !available.has(s))
+            if (missing.length) warnings.push(`Unknown sources (kept in the spec, but they don't exist in this workspace): ${missing.join(', ')}`)
+          }
+          if (input.skills?.length) {
+            // loadAllSkills matches dispatch-time [skill:slug] resolution (global + workspace).
+            const available = new Set(loadAllSkills(ws.rootPath).map(s => s.slug))
+            const missing = input.skills.filter(s => !available.has(s))
+            if (missing.length) warnings.push(`Unknown skills (kept in the spec, but they don't exist in this workspace): ${missing.join(', ')}`)
+          }
+
+          // A spec requires ≥1 node; synthesize the single executable node from the
+          // description. Multi-node DAG authoring stays with the TaskEditor/generate flow.
+          const parsed = parseTaskSpec({
+            id: slug,
+            title: input.title,
+            goal: input.description,
+            ...(input.acceptanceCriteria ? { acceptance_criteria: input.acceptanceCriteria } : {}),
+            ...(projectId ? { project: projectId } : {}),
+            ...(input.workingDirectory ? { cwd: input.workingDirectory } : {}),
+            ...(input.sources?.length ? { sources: input.sources } : {}),
+            ...(input.skills?.length ? { skills: input.skills } : {}),
+            ...(input.model || input.llmConnection
+              ? { defaults: { ...(input.model ? { model: input.model } : {}), ...(input.llmConnection ? { llmConnection: input.llmConnection } : {}) } }
+              : {}),
+            nodes: [{ id: 'main', title: input.title, prompt: input.description }],
+          })
+          if (!parsed.success) {
+            throw new Error(`Invalid task spec: ${parsed.error.issues.map(i => i.message).join('; ')}`)
+          }
+
+          const created = await createTaskFromSpec(this, ws.id, ws.rootPath, parsed.data)
+          return { ...created, warnings: [...warnings, ...created.warnings] }
+        },
+        // project_memory_append — one O_APPEND write per note, so sessions sharing a
+        // project never drop each other's notes (rewriting MEMORY.md from a
+        // session-start snapshot did). The project is read at call time.
+        appendProjectMemoryFn: async (input) => {
+          if (!managed.projectId) throw new Error('This session is not bound to a project.')
+          const { loadProjectById, appendProjectMemoryEntry } = await import('@craft-agent/shared/projects')
+          const project = loadProjectById(managed.workspace.rootPath, managed.projectId)
+          if (!project) throw new Error(`Project ${managed.projectId} not found.`)
+          const who = (managed.name || managed.id).replace(/\s+/g, ' ').trim()
+          return appendProjectMemoryEntry(managed.workspace.rootPath, project.config.slug, `${new Date().toISOString()} — ${who}`, input.note)
+        },
+        // Pages tools (list_pages/get_page/create_page/update_page/
+        // write_page_data/delete_page) — grouped callbacks bound to the
+        // invoking session's workspace. Storage flows are shared with the
+        // pages RPC handlers; after each mutation we poke the watcher (Linux
+        // atomic-rename workaround) and broadcast pages:changed, exactly like
+        // those handlers do.
+        pages: buildPagesToolCallbacks({
+          workspaceId: managed.workspace.id,
+          workspaceRootPath: managed.workspace.rootPath,
+          log: (message: string) => sessionLog.info(message),
+          onPagesMutated: async (pageSlug: string) => {
+            this.notifyConfigFileChange(managed.workspace.rootPath, `pages/${pageSlug}/page.json`)
+            const { loadWorkspacePages } = await import('@craft-agent/shared/pages')
+            this.broadcastPagesChanged(managed.workspace.id, loadWorkspacePages(managed.workspace.rootPath))
+          },
+          onContentChanged: (pageSlug: string) => {
+            this.enqueuePageThumbnail(managed.workspace.id, managed.workspace.rootPath, pageSlug)
+          },
+        }),
+        // MCP source resources & prompts (source_list_resources/source_read_resource/
+        // source_list_prompts/source_get_prompt). Pool and enabled sources are read
+        // at call time: getOrCreateAgent replaces the pool when it recreates the agent.
+        mcpSources: buildMcpSourceToolCallbacks({
+          getPool: () => managed.mcpPool,
+          getEnabledSourceSlugs: () => managed.enabledSourceSlugs,
+        }),
+        // Decision model (`decide`) — always wired; the callback re-checks the
+        // Settings switch, the feature toggle and the key on every call, so an
+        // agent that still advertises the tool after the user disabled it gets
+        // a clear "not enabled" answer instead of a stale client.
+        decide: buildDecisionToolCallbacks({
+          sessionId: managed.id,
+          log: (message: string) => sessionLog.info(message),
+        }),
+        // PR watcher tools (pr_status/pr_bind/pr_unbind/pr_set_auto_merge) — Coding mode. Bound to the
+        // invoking session; the registry (handlers/rpc/pr-watch) owns the GitHub credentials and the
+        // watcher, so tokens never reach the agent. getRegistry resolves the current instance at call
+        // time (it is recreated when the RPC handlers re-register).
+        prWatch: buildPrWatchToolCallbacks({
+          sessionId: managed.id,
+          sessionManager: this,
+          getRegistry: getPrWatchRegistry,
+          getAutoFixMonitor: getPrAutoFixMonitor,
+        }),
         getSessionInfoFn: (sessionId?: string) => {
           const targetId = sessionId ?? managed.id
           const session = this.sessions.get(targetId)
@@ -4077,9 +5230,12 @@ export class SessionManager implements ISessionManager {
             permissionMode: session.permissionMode ?? 'ask',
             createdAt: session.createdAt ?? 0,
             workingDirectory: session.workingDirectory,
+            projectId: session.projectId,
+            parentSessionId: session.parentSessionId,
             llmConnection: session.llmConnection,
             model: session.model,
             isActive: session.agent != null,
+            task: this.taskInfoForSession(session),
           }
         },
         listSessionsFn: (options) => {
@@ -4095,7 +5251,8 @@ export class SessionManager implements ISessionManager {
             sessions = sessions.filter(s => s.sessionStatus === options.status)
           }
           if (options?.label) {
-            sessions = sessions.filter(s => s.labels?.includes(options.label!))
+            // By label id: valued entries (`priority::3`) carry the id before the separator
+            sessions = sessions.filter(s => s.labels?.some(entry => entry === options.label || extractLabelId(entry) === options.label))
           }
           if (options?.search) {
             const needle = options.search.toLowerCase()
@@ -4126,8 +5283,41 @@ export class SessionManager implements ISessionManager {
               labels: s.labels ?? [],
               status: s.sessionStatus ?? 'todo',
               createdAt: s.createdAt ?? 0,
+              projectId: s.projectId,
+              parentSessionId: s.parentSessionId,
+              taskSlug: s.taskSlug,
             })),
           }
+        },
+        listBackgroundTasksFn: (sessionId?: string) => {
+          const targetId = sessionId ?? managed.id
+          const now = Date.now()
+          return this.listBackgroundTasks(targetId).map((t) => {
+            // No known start (someone else's task, or an unseen launch): report that instead of "0 s".
+            if (t.untracked || t.startUnknown) {
+              return {
+                taskId: t.taskId,
+                ...(t.intent ? { intent: t.intent } : {}),
+                ...(t.kind ? { kind: t.kind } : {}),
+                status: t.status,
+                completedAt: t.completedAt,
+                ...(t.untracked ? { untracked: true } : {}),
+              }
+            }
+            // Prefer wall-clock elapsed; running tasks tick off startTime, terminal
+            // tasks freeze at completion. Fall back to the last progress value.
+            const anchorEnd = t.status === 'running' ? now : (t.completedAt ?? now)
+            const wallElapsed = Math.max(0, Math.round((anchorEnd - t.startTime) / 1000))
+            return {
+              taskId: t.taskId,
+              intent: t.intent,
+              ...(t.kind ? { kind: t.kind } : {}),
+              status: t.status,
+              startTime: t.startTime,
+              elapsedSeconds: t.elapsedSeconds ?? wallElapsed,
+              completedAt: t.completedAt,
+            }
+          })
         },
         resolveLabelsFn: (labels: string[]) => {
           const labelConfig = loadLabelConfig(managed.workspace.rootPath)
@@ -4140,10 +5330,10 @@ export class SessionManager implements ISessionManager {
 
           // Exact ID match
           const byId = allStatuses.find(s => s.id === status)
-          if (byId) return { resolved: byId.id, available }
+          if (byId) return { resolved: byId.id, available, category: byId.category }
           // Case-insensitive label → ID
           const byLabel = allStatuses.find(s => s.label.toLowerCase() === status.toLowerCase())
-          if (byLabel) return { resolved: byLabel.id, available }
+          if (byLabel) return { resolved: byLabel.id, available, category: byLabel.category }
 
           return { resolved: null, available }
         },
@@ -4169,7 +5359,17 @@ export class SessionManager implements ISessionManager {
             if (builtAttachments.length > 0) fileAttachments = builtAttachments
           }
 
+          // Capture the target's busy state BEFORE delivery so the sender gets a
+          // truthful ack. A busy (mid-turn) target queues the message and replays
+          // it after the current turn (anthropic defaults to 'queue'); an idle
+          // target starts processing immediately. sendMessage throws for an
+          // unknown session — that rejection propagates to the handler's catch.
+          const targetBusy = this.sessions.get(sessionId)?.isProcessing === true
           await this.sendMessage(sessionId, message, fileAttachments)
+          return {
+            delivery: targetBusy ? ('queued' as const) : ('delivered' as const),
+            targetBusy,
+          }
         },
         activateSourceInSessionFn: async (sourceSlug: string) => {
           const cb = managed.agent?.onSourceActivationRequest
@@ -4183,20 +5383,32 @@ export class SessionManager implements ISessionManager {
               reason: 'Activation failed — source may be unusable (disabled/unauthenticated) or server build failed. Check session logs.',
             }
           }
-          // Both backends need the current turn to end before new tools are visible:
-          // Claude SDK freezes mcpServers at query() start; Pi only picks up new proxy
-          // tool defs on the next handlePrompt (`toolsChanged` flag in pi-agent-server).
-          // Mark a pending restart on the agent — ClaudeAgent/PiAgent consume it after
-          // the next tool_result, yield source_activated, and forceAbort. The
-          // `source_activated` handler in this class then schedules a server-side
-          // resend of the original user message with a "[{slug} activated]" suffix —
-          // landing in a fresh turn with tools live (craft-agents-oss#804).
+          // Both backends show new tools from the next turn on: Claude sets each turn's
+          // MCP servers on its keep-alive query at turn start (a per-turn query gets them
+          // at creation); Pi picks up new proxy tool defs on the next handlePrompt
+          // (`toolsChanged` flag in pi-agent-server). Mark a pending restart on the agent —
+          // ClaudeAgent/PiAgent consume it after the next tool_result, yield
+          // source_activated, and end the turn (Claude's keep-alive query is stopped like
+          // a user Stop, so its background agents survive). The `source_activated` handler
+          // in this class then schedules a server-side resend of the original user message
+          // with a "[{slug} activated]" suffix — a new turn with the tools live
+          // (craft-agents-oss#804).
           const userMessage = managed.agent?.getCurrentTurnUserMessage?.() ?? ''
           if (userMessage) {
             managed.agent?.setPendingSourceActivationRestart({ sourceSlug, userMessage })
           }
           return { ok: true, availability: 'next-turn' as const }
         },
+      })
+
+      // WS2 keep-alive: forward background task events that arrive BETWEEN turns
+      // (idle — no chat() generator consuming) into the normal event pipeline, so
+      // the running-task registry + renderer chips reflect a completion even when
+      // it lands while the session is idle. During a turn these events flow through
+      // the chat() generator as usual; this only covers the idle gap. No-op unless
+      // the backend supports a persistent cross-turn query (Claude keep-alive).
+      managed.agent.setBackgroundEventSink?.((event: AgentEvent) => {
+        void this.processEvent(managed, event)
       })
 
       // Wire up onSourceActivationRequest to auto-enable sources when agent tries to use them
@@ -4263,9 +5475,6 @@ export class SessionManager implements ISessionManager {
         const intendedSlugs = allEnabledSources
           .filter(isSourceUsable)
           .map(s => s.config.slug)
-
-        // Update bridge-mcp-server config/credentials for backends that need it
-        await applyBridgeUpdates(managed.agent!, sessionPath, allEnabledSources, mcpServers, managed.id, workspaceRootPath, 'source enable', managed.poolServer?.url)
 
         await managed.agent!.setSourceServers(mcpServers, apiServers, intendedSlugs)
 
@@ -4348,6 +5557,9 @@ export class SessionManager implements ISessionManager {
 
   async archiveSession(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      sessionLog.warn(`archiveSession: unknown session ${sessionId} — no-op`)
+    }
     if (managed) {
       managed.isArchived = true
       managed.archivedAt = Date.now()
@@ -4362,6 +5574,9 @@ export class SessionManager implements ISessionManager {
 
   async unarchiveSession(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      sessionLog.warn(`unarchiveSession: unknown session ${sessionId} — no-op`)
+    }
     if (managed) {
       managed.isArchived = false
       managed.archivedAt = undefined
@@ -4445,6 +5660,12 @@ export class SessionManager implements ISessionManager {
   async setPendingPlanExecution(sessionId: string, planPath: string, draftInputSnapshot?: string): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (managed) {
+      managed.pendingPlanExecution = {
+        planPath,
+        draftInputSnapshot,
+        awaitingCompaction: true,
+        executionDispatched: false,
+      }
       await setStoredPendingPlanExecution(managed.workspace.rootPath, sessionId, planPath, draftInputSnapshot)
       sessionLog.info(`Session ${sessionId}: set pending plan execution for ${planPath}`)
     }
@@ -4458,6 +5679,7 @@ export class SessionManager implements ISessionManager {
   async markCompactionComplete(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (managed) {
+      if (managed.pendingPlanExecution) managed.pendingPlanExecution.awaitingCompaction = false
       await markStoredCompactionComplete(managed.workspace.rootPath, sessionId)
       sessionLog.info(`Session ${sessionId}: compaction marked complete for pending plan`)
     }
@@ -4468,12 +5690,16 @@ export class SessionManager implements ISessionManager {
    * This prevents reload recovery from double-submitting the same plan if
    * sending succeeded but cleanup failed due a reconnect/disconnect.
    */
-  async markPendingPlanExecutionDispatched(sessionId: string): Promise<void> {
+  async markPendingPlanExecutionDispatched(sessionId: string): Promise<boolean> {
     const managed = this.sessions.get(sessionId)
-    if (managed) {
-      await markStoredPendingPlanExecutionDispatched(managed.workspace.rootPath, sessionId)
-      sessionLog.info(`Session ${sessionId}: marked pending plan execution as dispatched`)
+    if (!managed || managed.isProcessing) {
+      sessionLog.info(`Session ${sessionId}: pending plan dispatch claim rejected (missing or busy)`)
+      return false
     }
+    const claimed = await markStoredPendingPlanExecutionDispatched(managed.workspace.rootPath, sessionId)
+    if (claimed && managed.pendingPlanExecution) managed.pendingPlanExecution.executionDispatched = true
+    sessionLog.info(`Session ${sessionId}: pending plan execution dispatch claim ${claimed ? 'accepted' : 'rejected'}`)
+    return claimed
   }
 
   /**
@@ -4484,6 +5710,7 @@ export class SessionManager implements ISessionManager {
   async clearPendingPlanExecution(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (managed) {
+      delete managed.pendingPlanExecution
       await clearStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
       sessionLog.info(`Session ${sessionId}: cleared pending plan execution`)
     }
@@ -4496,13 +5723,19 @@ export class SessionManager implements ISessionManager {
   getPendingPlanExecution(sessionId: string): { planPath: string; draftInputSnapshot?: string; awaitingCompaction: boolean; executionDispatched: boolean } | null {
     const managed = this.sessions.get(sessionId)
     if (!managed) return null
+    if (managed.pendingPlanExecution) {
+      return {
+        ...managed.pendingPlanExecution,
+        executionDispatched: managed.pendingPlanExecution.executionDispatched === true,
+      }
+    }
     return getStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
   }
 
   /**
    * Dispatch a plan approval for a session, equivalent to the desktop
    * "Accept plan" button. Switches the session out of Explore mode (safe)
-   * into allow-all if needed so the plan can execute without per-tool
+   * into allow-all (or back to Guarded, see `planExecutionMode`) if needed so the plan can execute without per-tool
    * prompts, then sends the approval message through the normal sendMessage
    * path.
    */
@@ -4514,7 +5747,7 @@ export class SessionManager implements ISessionManager {
     }
 
     if (managed.permissionMode === 'safe') {
-      this.setSessionPermissionMode(sessionId, 'allow-all')
+      this.setSessionPermissionMode(sessionId, planExecutionMode(managed.previousPermissionMode))
     }
 
     await this.sendMessage(sessionId, PLAN_APPROVAL_MESSAGE)
@@ -4739,10 +5972,6 @@ export class SessionManager implements ISessionManager {
       // Set active source servers (tools are only available from these)
       const intendedSlugs = sources.filter(isSourceUsable).map(s => s.config.slug)
 
-      // Update bridge-mcp-server config/credentials for backends that need it
-      const usableSources = sources.filter(isSourceUsable)
-      await applyBridgeUpdates(managed.agent, sessionPath, usableSources, mcpServers, managed.id, workspaceRootPath, 'source config change', managed.poolServer?.url)
-
       await managed.agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
 
       sessionLog.info(`Applied ${Object.keys(mcpServers).length} MCP + ${Object.keys(apiServers).length} API sources to active agent (${allSources.length} total)`)
@@ -4918,7 +6147,11 @@ export class SessionManager implements ISessionManager {
    * Uses the last few user messages to capture what the session has evolved into.
    * Automatically uses the same provider as the session (Claude or OpenAI).
    */
-  async refreshTitle(sessionId: string): Promise<{ success: boolean; title?: string; error?: string }> {
+  /**
+   * Regenerate the session title. `onlyIfName` (automatic refreshes) keeps a title the user set
+   * while the new one was being generated.
+   */
+  async refreshTitle(sessionId: string, options?: { onlyIfName?: string }): Promise<{ success: boolean; title?: string; error?: string }> {
     sessionLog.info(`refreshTitle called for session ${sessionId}`)
     const managed = this.sessions.get(sessionId)
     if (!managed) {
@@ -4949,10 +6182,16 @@ export class SessionManager implements ISessionManager {
 
     const assistantResponse = lastAssistantMsg?.content ?? ''
 
-    // Derive language from app's i18n setting for language-aware title generation
-    const titleLangCode = (i18n.resolvedLanguage ?? 'en') as LanguageCode
-    const titleLangEntry = LOCALE_REGISTRY[titleLangCode]
-    const titleOptions = { language: titleLangEntry?.nativeName }
+    // Resolve title language from the explicitly persisted UI language (disk-backed,
+    // race-free vs. main-process i18n async hydration); undefined => auto-detect (#885).
+    const titleLanguage = resolveTitleLanguageName()
+    const titleOptions = { language: titleLanguage }
+    sessionLog.info(`[refreshTitle] language at call time`, {
+      sessionId,
+      persistedUiLanguage: getPersistedUiLanguage() ?? null,
+      resolvedLanguage: i18n.resolvedLanguage ?? null,
+      titleLanguage: titleLanguage ?? null,
+    })
 
     // Use existing agent or create temporary one
     let agent: AgentInstance | null = managed.agent
@@ -4965,6 +6204,8 @@ export class SessionManager implements ISessionManager {
 
         agent = createBackendFromConnection(managed.llmConnection, {
           workspace: managed.workspace,
+          // Preserve the selected model as a fallback if the account rejects its mini model.
+          model: managed.model,
           miniModel: resolvedMiniModel,
           session: {
             id: `title-${managed.id}`,
@@ -5001,8 +6242,14 @@ export class SessionManager implements ISessionManager {
     try {
       const title = await agent.regenerateTitle(userMessages, assistantResponse, titleOptions)
       sessionLog.info(`refreshTitle: regenerateTitle returned: ${title ? `"${title}"` : 'null'}`)
+      if (title && options?.onlyIfName !== undefined && managed.name !== options.onlyIfName) {
+        sessionLog.info(`refreshTitle: session ${sessionId} was renamed meanwhile, keeping "${managed.name}"`)
+        this.sendEvent({ type: 'title_regenerating', sessionId, isRegenerating: false }, managed.workspace.id)
+        return { success: false, error: 'Renamed meanwhile' }
+      }
       if (title) {
         managed.name = title
+        managed.autoTitle = title
         this.persistSession(managed)
         // title_generated will also clear isRegeneratingTitle via the event handler
         this.sendEvent({ type: 'title_generated', sessionId, title }, managed.workspace.id)
@@ -5447,15 +6694,28 @@ export class SessionManager implements ISessionManager {
     // duplicate that arrives from a legacy renderer still running the client-side
     // auto_retry. The first matching caller wins (server timer or legacy RPC,
     // whichever arrives first), subsequent matching calls within the deadline drop.
-    if (claimAutoRetryPending(managed, message) === 'drop') {
+    // The server's own retry may carry steered corrections, so a legacy renderer's plain copy no
+    // longer equals it: it claims the slot directly (that copy is then dropped as a duplicate).
+    const activationResend = managed.pendingActivationResend !== undefined && managed.pendingActivationResend === message
+    if (activationResend) {
+      managed.pendingActivationResend = undefined
+      if (managed.autoRetryPending) managed.autoRetryPending.committed = true
+    }
+    if (!activationResend && claimAutoRetryPending(managed, message) === 'drop') {
       sessionLog.info(`sendMessage: dropped duplicate source-activation retry for ${sessionId}`)
       return
     }
+    if (!activationResend && !_isAuthRetry) managed.turnFromUser = !options?.hidden
 
     // Clear any pending plan execution state when a new user message is sent.
-    // This acts as a safety valve - if the user moves on, we don't want to
-    // auto-execute an old plan later.
-    await clearStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
+    // The explicit /compact turn immediately after "Accept & Compact" is the
+    // one exception: that command is what transitions the pending record from
+    // awaiting → ready. Any other message remains a safety valve that cancels it.
+    const isCompactCommand = /^\/compact(\s|$)/i.test(message.trim())
+    if (!isCompactCommand) {
+      delete managed.pendingPlanExecution
+      await clearStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
+    }
 
     // Ensure messages are loaded before we try to add new ones
     await this.ensureMessagesLoaded(managed)
@@ -5475,23 +6735,13 @@ export class SessionManager implements ISessionManager {
       const connection = resolveSessionConnection(managed.llmConnection, undefined)
       // Fallback to 'steer' when no connection is resolvable — preserves
       // today's exact behavior (call redirect, take whatever it returns).
-      const behavior = connection ? resolveMidStreamBehavior(connection) : 'steer'
-
-      const agent = managed.agent
-      let steered = false
-      if (behavior === 'steer') {
-        steered = agent?.redirect(message) ?? false
-      }
-      // For 'queue': skip redirect entirely. The current turn is undisturbed.
-
-      sessionLog.info('mid-stream send', {
-        sessionId,
-        behavior,
-        steered,
-        queueLengthBefore: managed.messageQueue.length,
-        backend: agent ? agent.constructor.name : 'none',
-        connectionSlug: connection?.slug,
-      })
+      const configured = connection ? resolveMidStreamBehavior(connection) : 'steer'
+      // Mid-turn messages (decision model, toggle `midTurnMessages`): a text message is recorded as
+      // queued right away, like any queued message, and the model decides in the background whether
+      // it corrects the running work and should be steered in (steerQueuedIfDecided). Recording
+      // first keeps send order and leaves the queue the single source of truth.
+      const decideDelivery = canSteerTextPayload(attachments, storedAttachments, options) && this.decisionFeatureActive('midTurnMessages')
+      const behavior = decideDelivery ? 'queue' : configured
 
       // Create user message for UI
       const userMessage: Message = {
@@ -5501,8 +6751,32 @@ export class SessionManager implements ISessionManager {
         timestamp: this.monotonic(),
         attachments: storedAttachments,
         badges: options?.badges,
+        // Hidden system-generated messages reach the model but never render as a
+        // transcript bubble (e.g. background-task-completion nudge).
+        ...(options?.hidden ? { hidden: true } : {}),
       }
       managed.messages.push(userMessage)
+
+      const agent = managed.agent
+      // Redirect is text-only. Any semantic options/attachments use the normal
+      // host queue, without aborting the current turn or dropping the payload.
+      const textOnly = canSteerTextPayload(attachments, storedAttachments, options)
+      // A manual compaction owns the turn: nothing consumes steers, so queue for
+      // replay after `complete` instead of steering (OSS #1058). Not an interruption.
+      const compactionInFlight = agent?.isCompactionInFlight?.() === true
+      const attemptedSteer = shouldAttemptMidStreamSteer(behavior, textOnly, agent)
+      const steered = attemptedSteer && agent
+        ? agent.redirect(message, { messageId: userMessage.id })
+        : false
+      const payload: ManagedSession['messageQueue'][number] = { message, attachments, storedAttachments, options, messageId: userMessage.id, optimisticMessageId: options?.optimisticMessageId }
+      if (steered && agent?.takePendingSteers) {
+        (managed.acceptedSteers ??= new Map()).set(userMessage.id, payload)
+      }
+      if (steered) (managed.turnSteers ??= []).push(message)
+      sessionLog.info('mid-stream send', { sessionId, behavior, steered, textOnly, compactionInFlight, queueLengthBefore: managed.messageQueue.length })
+
+      const delivery = resolveMidStreamDeliveryOutcome(attemptedSteer ? 'steer' : 'queue', steered)
+      userMessage.isQueued = delivery.shouldQueue
 
       // Emit to UI — 'accepted' iff a steer succeeded; 'queued' otherwise
       // (covers both queue-direct and queue-after-abort paths).
@@ -5510,17 +6784,24 @@ export class SessionManager implements ISessionManager {
         type: 'user_message',
         sessionId,
         message: userMessage,
-        status: steered ? 'accepted' : 'queued',
+        status: delivery.shouldQueue ? 'queued' : 'accepted',
         optimisticMessageId: options?.optimisticMessageId
       }, managed.workspace.id)
 
-      if (!steered) {
+      if (delivery.shouldQueue) {
         // Push for FIFO replay on next onProcessingStopped tick. Same shape
         // for both queue-direct (current turn still running) and
         // queue-after-abort (backend already aborted) — the replay path in
         // processNextQueuedMessage is identical.
-        managed.messageQueue.push({ message, attachments, storedAttachments, options, messageId: userMessage.id, optimisticMessageId: options?.optimisticMessageId })
-        managed.wasInterrupted = true
+        managed.messageQueue.push(payload)
+        if (this.decisionFeatureActive('midTurnMessages')) payload.continuationCheck = this.markQueuedContinuation(managed, payload)
+        if (decideDelivery) void this.steerQueuedIfDecided(managed, payload, userMessage, configured)
+        // Only claim interruption when a steer attempt actually aborted the
+        // in-flight turn. In 'queue' mode the current turn runs to natural
+        // completion, so the replayed turn must NOT inject the "previous response
+        // was interrupted" reminder (it would falsely tell the model its own
+        // complete answer was cut off → confusion).
+        if (delivery.wasInterrupted) managed.wasInterrupted = true
       }
 
       this.persistSession(managed)
@@ -5550,11 +6831,17 @@ export class SessionManager implements ISessionManager {
         timestamp: this.monotonic(),
         attachments: storedAttachments, // Include for persistence (has thumbnailBase64)
         badges: options?.badges,  // Include content badges (sources, skills with embedded icons)
+        // Hidden system-generated messages reach the model but never render as a
+        // transcript bubble (e.g. background-task-completion nudge).
+        ...(options?.hidden ? { hidden: true } : {}),
       }
       managed.messages.push(userMessage)
 
-      // Update lastMessageRole for badge display
-      managed.lastMessageRole = 'user'
+      // Update lastMessageRole for badge display. Skip for hidden messages so the
+      // session-list preview isn't briefly driven by an invisible system nudge.
+      if (!options?.hidden) {
+        managed.lastMessageRole = 'user'
+      }
 
       // Persist + flush before announcing — the user message must be
       // genuinely on disk before we tell the renderer "accepted", and
@@ -5576,7 +6863,10 @@ export class SessionManager implements ISessionManager {
       // AI generation will enhance it later, but we always have a title from the start
       // Automation sessions (triggeredBy set) already have a title and skip AI generation entirely
       const isFirstUserMessage = managed.messages.filter(m => m.role === 'user').length === 1
-      if (isFirstUserMessage && !managed.name && !managed.triggeredBy) {
+      // Smart titles: the first message was small talk; title this one if the name is still automatic.
+      const titlesDeferredMessage = !isFirstUserMessage && !options?.hidden && managed.titleDeferred && managed.name === managed.autoTitle
+      if ((isFirstUserMessage && !managed.name && !managed.triggeredBy) || titlesDeferredMessage) {
+        managed.titleDeferred = false
         // Replace bracket mentions with their display labels (e.g. [skill:ws:commit] -> "Commit")
         // so titles show human-readable names instead of raw IDs
         let titleSource = message
@@ -5591,6 +6881,7 @@ export class SessionManager implements ISessionManager {
         const sanitized = sanitizeForTitle(titleSource)
         const initialTitle = sanitized.slice(0, 50) + (sanitized.length > 50 ? '…' : '')
         managed.name = initialTitle
+        managed.autoTitle = initialTitle
         this.persistSession(managed)
         // Flush immediately so disk is authoritative before notifying renderer
         await this.flushSession(managed.id)
@@ -5602,42 +6893,33 @@ export class SessionManager implements ISessionManager {
 
         // Generate AI title asynchronously using agent's SDK
         // (waits briefly for agent creation if needed)
-        this.generateTitle(managed, message)
+        void this.generateTitleUnlessSmallTalk(managed, message)
       }
     }
 
     // Evaluate auto-label rules against the user message (common path for both
-    // fresh and queued messages). Scans regex patterns configured on labels,
-    // then merges any new matches into the session's label array.
-    try {
-      const labelTree = listLabels(managed.workspace.rootPath)
-      const autoMatches = evaluateAutoLabels(message, labelTree)
-
-      if (autoMatches.length > 0) {
-        const existingLabels = managed.labels ?? []
-        const newEntries = autoMatches
-          .map(m => `${m.labelId}::${m.value}`)
-          .filter(entry => !existingLabels.includes(entry))
-
-        if (newEntries.length > 0) {
-          managed.labels = [...existingLabels, ...newEntries]
-          this.persistSession(managed)
-          this.sendEvent({
-            type: 'labels_changed',
-            sessionId,
-            labels: managed.labels,
-          }, managed.workspace.id)
-        }
+    // fresh and queued messages). Regex rules run synchronously here; semantic
+    // rules (decision model) run fire-and-forget so they never delay the turn,
+    // and merge their matches when they arrive.
+    // Hidden messages (auto-retries, system nudges) are not user-authored: they label nothing.
+    if (!options?.hidden) {
+      try {
+        const labelTree = listLabels(managed.workspace.rootPath)
+        this.applyAutoLabelMatches(managed, evaluateAutoLabels(message, labelTree, managed.labels ?? []), labelTree)
+        void this.applySemanticAutoLabels(managed, message, labelTree)
+      } catch (e) {
+        sessionLog.warn(`Auto-label evaluation failed for session ${sessionId}:`, e)
       }
-    } catch (e) {
-      sessionLog.warn(`Auto-label evaluation failed for session ${sessionId}:`, e)
     }
 
     managed.lastMessageAt = Date.now()
     this.setProcessing(managed, true)
     managed.streamingText = ''
+    managed.streamingTurnId = undefined
     managed.processingGeneration++
     managed.turnStartFinalMessageId = this.getLastFinalAssistantMessageId(managed.messages)
+    // A new turn: an auto-retry of this one already carries the earlier turn's steers.
+    managed.turnSteers = []
 
     // Reset auth retry flag for this new message (allows one retry per message)
     // IMPORTANT: Skip reset if this is an auth retry call - the flag is already true
@@ -5654,10 +6936,15 @@ export class SessionManager implements ISessionManager {
     managed.lastSentAttachments = attachments
     managed.lastSentStoredAttachments = storedAttachments
     managed.lastSentOptions = options
+    const replayedIds = existingMessageId ? managed.replayMergedIds?.get(existingMessageId) : undefined
+    if (existingMessageId) managed.replayMergedIds?.delete(existingMessageId)
+    managed.lastSentMessageIds = replayedIds ?? [userMessage.id]
 
     // Capture the generation to detect if a new request supersedes this one.
     // This prevents the finally block from clobbering state when a follow-up message arrives.
     const myGeneration = managed.processingGeneration
+    // A Stop from now on (not a stale stopRequested flag) keeps this turn from starting.
+    const turnStopEpoch = managed.stopEpoch ?? 0
 
     // Pre-enable sources required by invoked skills (Issue #249)
     // This eliminates the two-turn penalty where the agent discovers missing sources at runtime.
@@ -5717,6 +7004,9 @@ export class SessionManager implements ISessionManager {
       }
     }
 
+    // Decision-model checks for this turn run while the agent is set up below.
+    const preTurnDecisions = this.startPreTurnDecisions(managed, message, options, { activationResend, authRetry: _isAuthRetry, attachments })
+
     // Start perf span for entire sendMessage flow
     const sendSpan = perf.span('session.sendMessage', { sessionId })
 
@@ -5768,11 +7058,14 @@ export class SessionManager implements ISessionManager {
         const usableSources = sources.filter(isSourceUsable)
         const intendedSlugs = usableSources.map(s => s.config.slug)
         await agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
-        await applyBridgeUpdates(agent, sessionPath, usableSources, mcpServers, sessionId, workspaceRootPath, 'send message', managed.poolServer?.url)
         sessionLog.info(`Applied ${mcpCount} MCP + ${apiCount} API sources to session ${sessionId} (${allSources.length} total)`)
       }
       sendSpan.mark('servers.applied')
     }
+
+    // Continued from another session: the summary this first turn carries may still be generating
+    // (the agent above was set up meanwhile)
+    if (managed.pendingHandoffSummary) await this.waitForHandoffSummary(managed)
 
     try {
       sessionLog.info('Starting chat for session:', sessionId)
@@ -5787,23 +7080,22 @@ export class SessionManager implements ISessionManager {
         sessionLog.info('Attachments:', attachments.length)
       }
 
-      // Skills mentioned via @mentions are handled by the SDK's Skill tool.
-      // The UI layer (extractBadges in mentions.ts) injects fully-qualified names
-      // in the rawText, and canUseTool in craft-agent.ts provides a fallback
-      // to qualify short names. No transformation needed here.
+      // Skills mentioned via @mentions are resolved by the UI layer (extractBadges
+      // in mentions.ts), which injects fully-qualified names in the rawText.
+      // No transformation needed here.
 
       // Ensure main process reads tool metadata from the correct session directory.
       // This must be set before each chat() call since multiple sessions share the process.
       const chatSessionDir = getSessionStoragePath(workspaceRootPath, sessionId)
       toolMetadataStore.setSessionDir(chatSessionDir)
 
-      // Inject interruption context so the LLM knows the previous turn was cut short.
-      // Uses <system-reminder> tags so the LLM treats it as transient system guidance
-      // rather than part of the user's message content. The original message is stored
-      // in session JSONL (line ~3952); this only affects the SDK's in-process context.
-      let effectiveMessage = message
-      if (managed.wasInterrupted) {
-        effectiveMessage = `${message}\n\n<system-reminder>The previous assistant response was interrupted by the user and may be incomplete. Do not repeat or continue the interrupted response unless asked. Focus on the new message above.</system-reminder>`
+      // Transient guidance for this turn (interruption notice, decision-model suggestion) travels
+      // as `turnContext`: the model sees it after the message, in <system-reminder> tags, but it
+      // is not part of the stored message nor of the resend after a source activation.
+      const turnContext: string[] = []
+      // A /compact turn takes no turn context, so the notice waits for the next real turn.
+      if (managed.wasInterrupted && !isCompactCommand) {
+        turnContext.push('<system-reminder>The previous assistant response was interrupted by the user and may be incomplete. Do not repeat or continue the interrupted response unless asked. Focus on the new message above.</system-reminder>')
         managed.wasInterrupted = false
       }
 
@@ -5828,11 +7120,43 @@ export class SessionManager implements ISessionManager {
         }, managed.workspace.id)
       }
 
+      const { thinkingOverride, suggestionHint } = preTurnDecisions ? await preTurnDecisions : { thinkingOverride: null, suggestionHint: null }
+      // Stopped, superseded or deleted while the agent was set up or the pre-turn checks ran: do not
+      // start the turn.
+      const stoppedMeanwhile = (managed.stopEpoch ?? 0) !== turnStopEpoch
+      const superseded = managed.processingGeneration !== myGeneration
+      const deleted = this.sessions.get(sessionId) !== managed
+      if (stoppedMeanwhile || superseded || deleted) {
+        sessionLog.info(`Turn for session ${sessionId} not started: ${deleted ? 'deleted' : superseded ? 'superseded' : 'stopped'} before it began`)
+        sendSpan.mark('chat.not_started')
+        if (deleted) return  // the finally block below cleans up
+        sendSpan.end()
+        if (!superseded) this.onProcessingStopped(sessionId, 'interrupted')
+        return
+      }
+      if (suggestionHint) turnContext.push(suggestionHint)
+      // A /compact turn takes no context: text around it would become compaction instructions (a
+      // task's spec then goes with the next turn).
+      const sessionContext = isCompactCommand ? null : this.takeTaskSessionContext(managed, _isAuthRetry)
+      const chatOptions: ChatOptions = {
+        ...(thinkingOverride ? { thinkingOverride } : {}),
+        ...(sessionContext ? { sessionContext } : {}),
+        ...(turnContext.length > 0 && !isCompactCommand ? { turnContext: turnContext.join('\n\n') } : {}),
+      }
+
       sendSpan.mark('chat.starting')
-      const chatIterator = agent.chat(effectiveMessage, modelInputAttachments.attachments)
+      const chatIterator = agent.chat(message, modelInputAttachments.attachments, Object.keys(chatOptions).length > 0 ? chatOptions : undefined)
       sessionLog.info('Got chat iterator, starting iteration...')
 
       for await (const event of chatIterator) {
+        // Handoff may start a new turn before the old SDK iterator settles.
+        // Pending steers were transferred synchronously at the handoff boundary;
+        // trailing old events must not complete or mutate the replacement turn.
+        if (managed.processingGeneration !== myGeneration) {
+          sendSpan.mark('chat.superseded')
+          sendSpan.end()
+          return
+        }
         // Log events (skip noisy text_delta)
         if (event.type !== 'text_delta') {
           if (event.type === 'tool_start') {
@@ -5941,7 +7265,10 @@ export class SessionManager implements ISessionManager {
 
           sendSpan.mark('chat.complete')
           sendSpan.end()
-          this.onProcessingStopped(sessionId, 'complete')
+          // The backend also ends a turn the user stopped with `complete`. Reporting that as a
+          // completion marked a stopped task step done with no output (found 2026-10-11).
+          const stoppedDuringTurn = (managed.stopEpoch ?? 0) !== turnStopEpoch
+          this.onProcessingStopped(sessionId, stoppedDuringTurn ? 'interrupted' : 'complete')
           return  // Exit function, skip finally block (onProcessingStopped handles cleanup)
         }
 
@@ -5951,6 +7278,11 @@ export class SessionManager implements ISessionManager {
         // This ensures we don't lose in-flight messages.
       }
 
+      if (managed.processingGeneration !== myGeneration) {
+        sendSpan.mark('chat.superseded')
+        sendSpan.end()
+        return
+      }
       // Loop exited - either via complete event (normal) or generator ended after soft interrupt
       if (!managed.isProcessing) {
         sessionLog.info('Chat loop exited after explicit handoff/stop')
@@ -5963,6 +7295,11 @@ export class SessionManager implements ISessionManager {
         sessionLog.info('Chat loop exited unexpectedly')
       }
     } catch (error) {
+      if (managed.processingGeneration !== myGeneration) {
+        sendSpan.mark('chat.superseded')
+        sendSpan.end()
+        return
+      }
       // Check if this is an abort error (expected when interrupted)
       const isAbortError = error instanceof Error && (
         error.name === 'AbortError' ||
@@ -6025,6 +7362,10 @@ export class SessionManager implements ISessionManager {
 
     sessionLog.info('Cancelling processing for session:', sessionId, silent ? '(silent)' : '')
 
+    // A hard Stop visibly cancels undelivered accepted steers just like queued
+    // sends. Transfer first so the existing input-restoration path includes them.
+    this.recoverPendingSteers(managed)
+
     // Collect queued message text for input restoration before clearing
     const queuedTexts = managed.messageQueue.map(q => q.message)
 
@@ -6045,13 +7386,17 @@ export class SessionManager implements ISessionManager {
     // Signal intent to stop - let the event loop drain remaining events before clearing isProcessing
     // This prevents losing in-flight messages after soft interrupt
     managed.stopRequested = true
+    // Prompts of the stopped turn can no longer be answered, and a turn still being prepared must
+    // not start (see the risk-badge path and sendMessage).
+    managed.stopEpoch = (managed.stopEpoch ?? 0) + 1
 
     // Track interruption so the next user message gets a context note
     // telling the LLM the previous response was cut short
     managed.wasInterrupted = true
 
-    // Force-abort via Query.close() - sends soft interrupt to the backend
-    if (managed.agent) {
+    // Stop the turn, keeping background agents alive where the backend can (Claude keep-alive);
+    // otherwise hard-abort.
+    if (managed.agent && !managed.agent.stopTurn?.()) {
       managed.agent.forceAbort(AbortReason.UserStop)
     }
 
@@ -6128,6 +7473,7 @@ export class SessionManager implements ISessionManager {
 
         // 2. Destroy the agent — the new agent's postInit() will refresh auth
         sessionLog.info(`[auth-retry] Destroying agent for session ${sessionId}`)
+        this.recoverPendingSteers(managed)
         managed.agent = null
 
         // 3. Retry the message
@@ -6140,11 +7486,16 @@ export class SessionManager implements ISessionManager {
           sessionLog.info(`[auth-retry] Retrying message for session ${sessionId}`)
           this.setProcessing(managed, false)
 
-          // Remove the user message that was added for this failed attempt
-          // so we don't get duplicate messages when retrying
-          const lastUserMsgIndex = managed.messages.findLastIndex(m => m.role === 'user')
-          if (lastUserMsgIndex !== -1) {
-            managed.messages.splice(lastUserMsgIndex, 1)
+          // Remove the user message(s) that were added for this failed attempt
+          // so we don't get duplicate messages when retrying (a merged replay has several)
+          const failedIds = new Set(managed.lastSentMessageIds ?? [])
+          if (failedIds.size > 0 && managed.messages.some(m => failedIds.has(m.id))) {
+            managed.messages = managed.messages.filter(m => !failedIds.has(m.id))
+          } else {
+            const lastUserMsgIndex = managed.messages.findLastIndex(m => m.role === 'user')
+            if (lastUserMsgIndex !== -1) {
+              managed.messages.splice(lastUserMsgIndex, 1)
+            }
           }
 
           managed.authRetryInProgress = false
@@ -6188,6 +7539,103 @@ export class SessionManager implements ISessionManager {
   }
 
   /**
+   * Listeners for the in-process session-completion seam (see SessionCompletionEvent).
+   * Used by the Tasks Conductor; empty until something subscribes, so zero overhead otherwise.
+   */
+  private sessionCompletionListeners = new Set<(evt: SessionCompletionEvent) => void>()
+  private readonly sessionActivityListeners = new Map<string, Set<() => void>>()
+
+  /**
+   * Subscribe to in-process session completion (Tasks Conductor seam).
+   * Returns an unsubscribe function. Not a renderer event; not agent-facing.
+   */
+  onSessionComplete(listener: (evt: SessionCompletionEvent) => void): () => void {
+    this.sessionCompletionListeners.add(listener)
+    return () => {
+      this.sessionCompletionListeners.delete(listener)
+    }
+  }
+
+  /**
+   * Subscribe to a session's activity: called for every event its agent emits (text, thinking,
+   * tool calls, status). Lets a caller time out only a turn that has stalled, not one that is
+   * slow but working. In-process only. Returns an unsubscribe function.
+   */
+  onSessionActivity(sessionId: string, listener: () => void): () => void {
+    let listeners = this.sessionActivityListeners.get(sessionId)
+    if (!listeners) {
+      listeners = new Set()
+      this.sessionActivityListeners.set(sessionId, listeners)
+    }
+    listeners.add(listener)
+    return () => {
+      const current = this.sessionActivityListeners.get(sessionId)
+      current?.delete(listener)
+      if (current?.size === 0) this.sessionActivityListeners.delete(sessionId)
+    }
+  }
+
+  private notifySessionActivity(sessionId: string): void {
+    const listeners = this.sessionActivityListeners.get(sessionId)
+    if (!listeners) return
+    for (const listener of [...listeners]) {
+      try {
+        listener()
+      } catch (err) {
+        sessionLog.error(`onSessionActivity listener threw for session ${sessionId}:`, err)
+      }
+    }
+  }
+
+  private emitSessionComplete(evt: SessionCompletionEvent): void {
+    if (this.sessionCompletionListeners.size === 0) return
+    // Iterate a snapshot: a listener that re-subscribes synchronously while handling this event
+    // (the Conductor re-attaches its one-shot verdict listener before re-asking the orchestrator)
+    // must see the NEXT completion, not be re-entered by this one. Live-Set iteration visits
+    // entries added mid-loop, which re-asked the same reply up to MAX_UNPARSED_REASKS+1 times and
+    // failed runs before the orchestrator could answer.
+    for (const listener of [...this.sessionCompletionListeners]) {
+      try {
+        listener(evt)
+      } catch (err) {
+        sessionLog.error(`onSessionComplete listener threw for session ${evt.sessionId}:`, err)
+      }
+    }
+  }
+
+  /** Reconcile an accepted steer with its original bubble and full host payload. */
+  private recoverUndeliveredSteer(managed: ManagedSession, steer: { message: string; messageId?: string }): void {
+    const payload = steer.messageId ? managed.acceptedSteers?.get(steer.messageId) : { message: steer.message }
+    // Identity-bearing events are idempotent, including trailing events after Stop.
+    if (!payload) return
+    if (steer.messageId) managed.acceptedSteers?.delete(steer.messageId)
+    const existing = payload.messageId ? managed.messages.find(m => m.id === payload.messageId) : undefined
+    if (existing) {
+      existing.isQueued = true
+      this.sendEvent({ type: 'user_message', sessionId: managed.id, message: existing,
+        status: 'queued', optimisticMessageId: payload.optimisticMessageId }, managed.workspace.id)
+    }
+    // Recover into original arrival order, including attachment sends that were
+    // already queued while this text steer was pending inside the backend.
+    const index = existing ? managed.messages.indexOf(existing) : -1
+    const before = index < 0 ? -1 : managed.messageQueue.findIndex(item => {
+      const queuedIndex = managed.messages.findIndex(m => m.id === item.messageId)
+      return queuedIndex > index
+    })
+    if (before < 0) managed.messageQueue.push(payload)
+    else managed.messageQueue.splice(before, 0, payload)
+    this.persistSession(managed)
+  }
+
+  /** Synchronous ownership transfer before a backend is paused or disposed. */
+  private recoverPendingSteers(managed: ManagedSession): void {
+    for (const steer of managed.agent?.takePendingSteers?.() ?? []) {
+      this.recoverUndeliveredSteer(managed, steer)
+    }
+    managed.acceptedSteers?.clear()
+  }
+
+  /**
    * Central handler for when processing stops (any reason).
    * Single source of truth for cleanup and queue processing.
    *
@@ -6203,9 +7651,24 @@ export class SessionManager implements ISessionManager {
 
     sessionLog.info(`Processing stopped for session ${sessionId}: ${reason}`)
 
+    // Backend recovery events precede complete; discard payloads already delivered.
+    managed.acceptedSteers?.clear()
+
     // 1. Cleanup state
     this.setProcessing(managed, false)
     managed.stopRequested = false  // Reset for next turn
+    // The request is over unless a source activation is about to re-send it.
+    if (!managed.autoRetryTimer && managed.pendingActivationResend === undefined) {
+      this.finishSuggestionTrace(managed)
+      finishLargeResultExcerpts(managed.id)
+    }
+
+    // 1b. Orphan backstop: with the default per-turn subprocess model, any
+    // background sub-agent still marked `running` dies when this turn's
+    // subprocess is torn down. Flip those registry entries to `orphaned` so a
+    // later "status?" query never reports a dead task as running. Suppressed
+    // when WS2 keep-alive keeps the query alive across turns.
+    this.markOrphanedBackgroundTasks(sessionId)
 
     const turnStartFinalMessageId = managed.turnStartFinalMessageId
     managed.turnStartFinalMessageId = undefined
@@ -6215,7 +7678,13 @@ export class SessionManager implements ISessionManager {
     // Full unbind happens below when the queue is empty (session truly done).
     const turnBpm = this.getBrowserPaneManagerForSession(sessionId)
     if (turnBpm) {
-      await turnBpm.clearVisualsForSession(sessionId)
+      // Same guard as the queue-empty teardown below: a remote BPM throw on a
+      // headless server must not abort processing-stop handling.
+      try {
+        await turnBpm.clearVisualsForSession(sessionId)
+      } catch (err) {
+        sessionLog.warn(`Browser-pane visual clear failed for ${sessionId} (continuing):`, err)
+      }
     }
 
     // 2. Handle unread state based on whether user is viewing this session
@@ -6267,8 +7736,16 @@ export class SessionManager implements ISessionManager {
       // On the next turn, getOrCreateForSession() will re-bind it.
       const doneBpm = this.getBrowserPaneManagerForSession(sessionId)
       if (doneBpm) {
-        await doneBpm.clearVisualsForSession(sessionId)
-        doneBpm.unbindAllForSession(sessionId)
+        // Teardown must never block completion. On a headless/WebUI server the BPM is
+        // remote and these calls throw (BROWSER_NO_CAPABLE_CLIENT) when no desktop
+        // browser client is connected — which previously aborted onProcessingStopped
+        // before emitSessionComplete, hanging the Tasks Conductor completion seam.
+        try {
+          await doneBpm.clearVisualsForSession(sessionId)
+          doneBpm.unbindAllForSession(sessionId)
+        } catch (err) {
+          sessionLog.warn(`Browser-pane teardown failed for ${sessionId} (continuing to completion):`, err)
+        }
       }
 
       // No queue - emit complete to UI (include tokenUsage and hasUnread for state updates)
@@ -6277,7 +7754,36 @@ export class SessionManager implements ISessionManager {
         sessionId,
         tokenUsage: managed.tokenUsage,
         hasUnread: managed.hasUnread,  // Propagate unread state to renderer
+        // WS2: when keep-alive keeps the persistent query open across turns, the
+        // turn ending does NOT kill background sub-agents. Tell the renderer so its
+        // chip orphan-backstop does not falsely flip live tasks to `orphaned`; a
+        // real `task_completed` will arrive when the agent actually finishes.
+        backgroundTasksAlive: this.keepBackgroundTasksAlive,
       }, managed.workspace.id)
+
+      // Tasks Conductor seam: signal true completion (queue empty) with the stop
+      // reason + this turn's final assistant message, so the Conductor can advance
+      // the corresponding node. In-process only; never sent to the renderer/agents.
+      const turnFinalMessageId = didReceiveNewFinalMessage ? currentFinalMessageId : undefined
+      this.emitSessionComplete({
+        sessionId,
+        workspaceId: managed.workspace.id,
+        reason,
+        finalMessageId: turnFinalMessageId,
+        finalText: turnFinalMessageId
+          ? managed.messages.find(m => m.id === turnFinalMessageId)?.content
+          : undefined,
+        backgroundWorkRunning: this.countRunningBackgroundWork(managed),
+        fromUser: managed.turnFromUser !== false,
+        tokenUsage: managed.tokenUsage,
+      })
+
+      // Hidden/mini sessions have no status worth changing; task sessions are the Conductor's.
+      if (reason === 'complete' && didReceiveNewFinalMessage && currentFinalMessageId
+          && !managed.hidden && managed.systemPromptPreset !== 'mini' && !managed.taskRunId && !managed.taskSlug) {
+        void this.applyTurnOutcome(managed, currentFinalMessageId)
+        if (!managed.triggeredBy) void this.refreshTitleIfDrifted(managed)
+      }
     }
 
     // 6. Always persist
@@ -6292,19 +7798,40 @@ export class SessionManager implements ISessionManager {
     const managed = this.sessions.get(sessionId)
     if (!managed || managed.messageQueue.length === 0) return
 
-    const next = managed.messageQueue.shift()!
+    const first = managed.messageQueue.shift()!
+    // Mid-turn messages: entries judged to continue this one are replayed with it as one turn.
+    const merged: typeof managed.messageQueue = []
+    let last: object = first
+    while (managed.messageQueue[0]?.mergeWith === last) {
+      last = managed.messageQueue.shift()!
+      merged.push(last as typeof first)
+    }
+    const next = merged.length > 0
+      ? { ...first, message: [first, ...merged].map(entry => entry.message).join('\n\n') }
+      : first
+    if (merged.length > 0 && first.messageId) {
+      const ids = [first, ...merged].map(entry => entry.messageId).filter((id): id is string => !!id)
+      ;(managed.replayMergedIds ??= new Map()).set(first.messageId, ids)
+    }
     sessionLog.info('replay queued', {
       sessionId,
       messageId: next.messageId,
+      mergedMessageIds: merged.length > 0 ? merged.map(entry => entry.messageId) : undefined,
       queueLengthAfterShift: managed.messageQueue.length,
     })
 
-    // Update UI: queued → processing
-    if (next.messageId) {
-      const existingMessage = managed.messages.find(m => m.id === next.messageId)
+    // Update UI: queued → processing (merged continuations are delivered in the same turn)
+    for (const entry of [first, ...merged]) {
+      if (!entry.messageId) continue
+      const existingMessage = managed.messages.find(m => m.id === entry.messageId)
       if (existingMessage) {
         // Clear isQueued flag and persist - prevents re-queueing if crash during processing
         existingMessage.isQueued = false
+        // Re-stamp so this replayed message sorts AFTER the previous turn's
+        // finalized assistant reply. It was created mid-stream (an earlier
+        // timestamp) while queued; groupMessagesByTurn sorts by timestamp, so
+        // without this the prior turn's completed response would render BELOW it.
+        existingMessage.timestamp = this.monotonic()
         this.persistSession(managed)
 
         this.sendEvent({
@@ -6312,7 +7839,7 @@ export class SessionManager implements ISessionManager {
           sessionId,
           message: existingMessage,
           status: 'processing',
-          optimisticMessageId: next.optimisticMessageId
+          optimisticMessageId: entry.optimisticMessageId
         }, managed.workspace.id)
       }
     }
@@ -6354,113 +7881,153 @@ export class SessionManager implements ISessionManager {
     })
   }
 
-  async killShell(sessionId: string, shellId: string): Promise<{ success: boolean; error?: string }> {
+  /**
+   * Stop one background task (shell, agent or workflow) through the session's live agent (SDK
+   * `stop_task`). The stopped status arrives as a task_completed event, which resolves the chip.
+   * Without a live query the task cannot still be running: it ended with the subprocess that ran it.
+   * (This replaced a `pgrep -f <command>` + SIGTERM that also killed same-command processes of other
+   * sessions and projects.)
+   */
+  async stopBackgroundTask(sessionId: string, taskId: string): Promise<StopBackgroundTaskResult> {
     const managed = this.sessions.get(sessionId)
-    if (!managed) {
-      return { success: false, error: 'Session not found' }
-    }
-
-    sessionLog.info(`Killing shell ${shellId} for session: ${sessionId}`)
-
-    // Try to kill the actual process using the stored command
-    const command = managed.backgroundShellCommands.get(shellId)
-    if (command) {
-      try {
-        // Use pkill to find and kill processes matching the command
-        // The -f flag matches against the full command line
-        const { exec } = await import('child_process')
-        const { promisify } = await import('util')
-        const execAsync = promisify(exec)
-
-        // Escape the command for use in pkill pattern
-        // We search for the unique command string in process args
-        const escapedCommand = command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-
-        sessionLog.info(`Attempting to kill process with command: ${command.slice(0, 100)}...`)
-
-        // Use pgrep first to find the PID, then kill it
-        // This is safer than pkill -f which can match too broadly
-        try {
-          const { stdout } = await execAsync(`pgrep -f "${escapedCommand}"`)
-          const pids = stdout.trim().split('\n').filter(Boolean)
-
-          if (pids.length > 0) {
-            sessionLog.info(`Found ${pids.length} process(es) to kill: ${pids.join(', ')}`)
-            // Kill each process
-            for (const pid of pids) {
-              try {
-                await execAsync(`kill -TERM ${pid}`)
-                sessionLog.info(`Sent SIGTERM to process ${pid}`)
-              } catch (killErr) {
-                // Process may have already exited
-                sessionLog.warn(`Failed to kill process ${pid}: ${killErr}`)
-              }
-            }
-          } else {
-            sessionLog.info(`No processes found matching command`)
-          }
-        } catch (pgrepErr) {
-          // pgrep returns exit code 1 when no processes found, which is fine
-          sessionLog.info(`No matching processes found (pgrep returned no results)`)
-        }
-
-        // Clean up the stored command
-        managed.backgroundShellCommands.delete(shellId)
-      } catch (err) {
-        sessionLog.error(`Error killing shell process: ${err}`)
+    if (!managed) return { success: false, error: 'Session not found' }
+    const entry = managed.backgroundTaskRegistry.get(taskId)
+    // Nothing alive to stop: record it, so status queries agree with the chip
+    const notRunning = (): StopBackgroundTaskResult => {
+      if (entry?.status === 'running') {
+        entry.status = 'stopped'
+        entry.completedAt = Date.now()
       }
-    } else {
-      sessionLog.warn(`No command stored for shell ${shellId}, cannot kill process`)
+      return { success: false, error: 'not-running' }
     }
-
-    // Always emit shell_killed to remove from UI regardless of process kill success
-    this.sendEvent({
-      type: 'shell_killed',
-      sessionId,
-      shellId,
-    }, managed.workspace.id)
-
-    return { success: true }
+    if (entry && entry.status !== 'running') return { success: false, error: 'not-running' }
+    const stop = managed.agent?.stopBackgroundTask
+    if (!stop) return notRunning()
+    if (entry) entry.stopRequestedAt = Date.now()
+    try {
+      const stopped = await stop.call(managed.agent, taskId)
+      sessionLog.info(`[bg-lifecycle] stop requested`, { sessionId, taskId, delivered: stopped })
+      return stopped ? { success: true } : notRunning()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // The CLI no longer knows the task (it finished, or died with an earlier subprocess), or the
+      // query is gone: the task is not running — not a failure to report.
+      if (/no task found|is not running|query closed|not running/i.test(message)) return notRunning()
+      if (entry) entry.stopRequestedAt = undefined
+      sessionLog.warn(`[bg-lifecycle] stop failed for task ${taskId}:`, error)
+      return { success: false, error: 'failed' }
+    }
   }
 
   /**
-   * Get output from a background task
-   *
-   * Looks up the output file stored when a task_completed event was received,
-   * reads its contents, and returns them. Falls back to the SDK-provided summary
-   * if the file cannot be read.
-   *
-   * @param taskId - The task or shell ID
-   * @returns Task output content, or null if task not found
+   * What a background task of the session has written so far, digested for the chip's card: a
+   * shell's output tail, or an agent's latest message and recent steps. The file is the one the SDK
+   * reported on completion, else the `<taskId>.output` named in the launching tool call's result
+   * (see launchOutputFile). Null when there is nothing to read yet.
    */
-  async getTaskOutput(taskId: string): Promise<string | null> {
-    // O(1) lookup via taskOutputIndex
-    const sessionId = this.taskOutputIndex.get(taskId)
-    if (!sessionId) {
-      sessionLog.info(`No output found for task: ${taskId} (task may still be running)`)
-      return null
-    }
-
+  async getBackgroundTaskOutput(sessionId: string, taskId: string, kind?: 'agent' | 'shell' | 'workflow'): Promise<BackgroundTaskOutput | null> {
     const managed = this.sessions.get(sessionId)
-    const info = managed?.backgroundTaskOutputs.get(taskId)
-    if (!info) {
-      // Index out of sync — clean up stale entry
-      this.taskOutputIndex.delete(taskId)
+    if (!managed) return null
+    const path = this.backgroundTaskOutputFile(managed, taskId)
+    if (!path) return null
+    try {
+      return await readBackgroundTaskOutput(path, kind)
+    } catch (error) {
+      sessionLog.debug(`[bg-lifecycle] no readable output for task ${taskId} (${path}):`, error)
       return null
     }
+  }
 
-    sessionLog.info(`Found output for task ${taskId}: file=${info.outputFile}, status=${info.status}`)
-    try {
-      const content = await readFile(info.outputFile, 'utf-8')
-      // Delete after successful read to prevent memory leak
-      managed!.backgroundTaskOutputs.delete(taskId)
-      this.taskOutputIndex.delete(taskId)
-      return content
-    } catch (err) {
-      sessionLog.error(`Failed to read task output file: ${info.outputFile}`, err)
-      // Fall back to SDK-provided summary
-      return info.summary || null
+  private backgroundTaskOutputFile(managed: ManagedSession, taskId: string): string | undefined {
+    const reported = managed.backgroundTaskOutputs.get(taskId)?.outputFile
+    if (reported) return reported
+    const toolUseId = managed.backgroundTaskRegistry.get(taskId)?.toolUseId
+    if (!toolUseId) return undefined
+    const launch = managed.messages.find(message => message.toolUseId === toolUseId && message.toolResult)
+    return launch?.toolResult ? launchOutputFile(launch.toolResult, taskId) : undefined
+  }
+
+  /**
+   * Evict stale entries from both background-task maps to bound memory.
+   * - backgroundTaskOutputs: completed outputs older than 1h (existing behavior).
+   * - backgroundTaskRegistry: terminal/orphaned entries older than 1h. Running
+   *   entries are never evicted here (they are resolved on completion or orphaned
+   *   at turn end).
+   */
+  private evictStaleBackgroundTasks(managed: ManagedSession): void {
+    const ONE_HOUR = 3_600_000
+    const now = Date.now()
+    for (const [tid, info] of managed.backgroundTaskOutputs) {
+      if (now - info.completedAt > ONE_HOUR) {
+        managed.backgroundTaskOutputs.delete(tid)
+      }
     }
+    for (const [tid, info] of managed.backgroundTaskRegistry) {
+      if (info.status !== 'running' && info.completedAt && now - info.completedAt > ONE_HOUR) {
+        managed.backgroundTaskRegistry.delete(tid)
+      }
+    }
+  }
+
+  /**
+   * Mark still-running background tasks for a session as `orphaned`.
+   *
+   * Called when a turn finishes (onProcessingStopped). With the default per-turn
+   * subprocess model, background sub-agents die when the query/subprocess is torn
+   * down at turn end, but their terminal notifications may never arrive (or arrive
+   * only on a later turn's subprocess). Marking them `orphaned` here keeps a
+   * "status?" query truthful — it must never report a dead task as "running".
+   *
+   * No-op once WS2 keep-alive is enabled: with a persistent query the tasks
+   * genuinely outlive the turn, so `keepBackgroundTasksAlive` short-circuits this.
+   */
+  private markOrphanedBackgroundTasks(sessionId: string): void {
+    if (this.keepBackgroundTasksAlive) return
+    const managed = this.sessions.get(sessionId)
+    if (!managed) return
+    const now = Date.now()
+    let orphaned = 0
+    for (const info of managed.backgroundTaskRegistry.values()) {
+      if (info.status === 'running') {
+        info.status = 'orphaned'
+        info.completedAt = now
+        orphaned++
+      }
+    }
+    if (orphaned > 0) {
+      sessionLog.info(`[bg-lifecycle] turn ended — orphaned ${orphaned} still-running background task(s)`, {
+        sessionId,
+      })
+    }
+  }
+
+  /**
+   * Background agents and Workflows the session's own agent launched that are still running.
+   * Only keep-alive lets them outlive the turn (otherwise they were just marked orphaned), and
+   * their completion wakes the idle session. Shells and other tasks are left out: a dev server or
+   * a watcher may never end, and a task step must not wait for it.
+   */
+  private countRunningBackgroundWork(managed: ManagedSession): number {
+    if (!this.keepBackgroundTasksAlive) return 0
+    let running = 0
+    for (const task of managed.backgroundTaskRegistry.values()) {
+      if (task.status === 'running' && !task.untracked && (task.kind === 'agent' || task.kind === 'workflow')) running++
+    }
+    return running
+  }
+
+  /**
+   * Enumerate background tasks for a session for a "status?" query.
+   * Returns the main-process registry snapshot — the real source of truth across
+   * subprocess boundaries (the SDK's in-subprocess task tools cannot see tasks
+   * from a prior, torn-down subprocess).
+   */
+  listBackgroundTasks(sessionId: string): RunningBackgroundTask[] {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) return []
+    return Array.from(managed.backgroundTaskRegistry.values())
+      .map((t) => ({ ...t }))
+      .sort((a, b) => b.startTime - a.startTime)
   }
 
   /**
@@ -6535,7 +8102,7 @@ export class SessionManager implements ISessionManager {
   }
 
   /**
-   * Set the permission mode for a session ('safe', 'ask', 'allow-all')
+   * Set the permission mode for a session ('safe', 'ask', 'guarded', 'allow-all')
    */
   setSessionPermissionMode(sessionId: string, mode: PermissionMode): void {
     const managed = this.sessions.get(sessionId)
@@ -6659,7 +8226,7 @@ export class SessionManager implements ISessionManager {
   async setSessionLabels(sessionId: string, labels: string[]): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (managed) {
-      managed.labels = labels
+      managed.labels = this.canonicalLabels(managed.workspace.rootPath, labels) ?? []
       this.setMetadataWriteGuard(managed)
 
       this.sendEvent({
@@ -6676,6 +8243,300 @@ export class SessionManager implements ISessionManager {
       const watcher = this.configWatchers.get(managed.workspace.rootPath)
       watcher?.notifyFileChange(`sessions/${sessionId}/session.jsonl`)
     }
+  }
+
+  /**
+   * Apply the reserved Task labeling to a session. Every task gets its own ITEM label —
+   * a child of the root "Task" label named `TASK-<slug>-<N>` (plain boolean, no value) —
+   * and the task's whole family carries that same item label, so one label filters one
+   * task. Top-level sessions mint a fresh item label from their name; a session with
+   * `parentSessionId` inherits the parent's item label — and a parent that lacks one (a
+   * plain chat gaining its first subtask) is labeled in the same pass, so "becoming a
+   * task" holds by construction. Idempotent: a session already carrying an item label
+   * keeps it. Returns the resolved ITEM label id — slugs can collide-shift, so callers
+   * MUST use it rather than deriving ids themselves.
+   */
+  async applyTaskLabel(
+    sessionId: string,
+    opts?: { parentSessionId?: string },
+  ): Promise<{ labelId: string } | undefined> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) return undefined
+    const rootPath = managed.workspace.rootPath
+
+    const itemOf = (labels: string[] | undefined): string | undefined =>
+      findTaskItemLabelId(labels, loadLabelConfig(rootPath).labels)
+    const withItemEntry = (labels: string[] | undefined, itemId: string): string[] => [
+      ...(labels ?? []).filter(entry => extractLabelId(entry) !== itemId),
+      itemId,
+    ]
+
+    const existing = itemOf(managed.labels)
+    if (existing) return { labelId: existing }
+
+    let itemId: string
+    const parent = opts?.parentSessionId ? this.sessions.get(opts.parentSessionId) : undefined
+    if (parent) {
+      const parentItem = itemOf(parent.labels)
+      if (parentItem) {
+        itemId = parentItem
+      } else {
+        itemId = ensureTaskItemLabel(rootPath, parent.name || 'task').itemId
+        await this.setSessionLabels(parent.id, withItemEntry(parent.labels, itemId))
+      }
+    } else {
+      itemId = ensureTaskItemLabel(rootPath, managed.name || 'task').itemId
+    }
+
+    await this.setSessionLabels(sessionId, withItemEntry(managed.labels, itemId))
+    return { labelId: itemId }
+  }
+
+  /**
+   * Bind or unbind a session to/from a workspace project.
+   * Pass `null` to unbind. The session's working directory is NOT changed retroactively —
+   * the project binding is only used as a default for newly created sessions.
+   */
+  async setSessionProjectId(sessionId: string, projectId: string | null): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (managed) {
+      managed.projectId = projectId ?? undefined
+      this.setMetadataWriteGuard(managed)
+
+      this.sendEvent({
+        type: 'project_id_changed',
+        sessionId: managed.id,
+        projectId: managed.projectId ?? null,
+      }, managed.workspace.id)
+
+      this.persistSession(managed)
+      await this.flushSession(managed.id)
+      const watcher = this.configWatchers.get(managed.workspace.rootPath)
+      watcher?.notifyFileChange(`sessions/${sessionId}/session.jsonl`)
+    }
+  }
+
+  /**
+   * Set the kanban board column for a session ('todo' | 'in-progress' | 'done').
+   * Pass `null` to clear (board falls back to the default column). Independent of sessionStatus.
+   */
+  async setKanbanColumn(sessionId: string, column: string | null): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (managed) {
+      managed.kanbanColumn = column ?? undefined
+      this.setMetadataWriteGuard(managed)
+
+      this.persistSession(managed)
+      await this.flushSession(managed.id)
+      // Self-writes don't re-emit through the file watcher (kanbanColumn isn't in the header
+      // signature), so push a live metadata event for the board to consume.
+      this.sendEvent({ type: 'session_metadata_changed', sessionId, changes: { kanbanColumn: column ?? undefined } }, managed.workspace.id)
+      const watcher = this.configWatchers.get(managed.workspace.rootPath)
+      watcher?.notifyFileChange(`sessions/${sessionId}/session.jsonl`)
+    }
+  }
+
+  /**
+   * Record the total DAG node count on a Conductor orchestrator session. The board uses this as a
+   * stable progress denominator so it doesn't grow as child sessions are spawned lazily at dispatch.
+   */
+  async setTaskNodeCount(sessionId: string, count: number): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (managed) {
+      managed.taskNodeCount = count
+      this.setMetadataWriteGuard(managed)
+
+      this.persistSession(managed)
+      await this.flushSession(managed.id)
+      // Self-writes don't re-emit through the file watcher (taskNodeCount isn't in the header
+      // signature), so push a live metadata event so the progress denominator updates immediately.
+      this.sendEvent({ type: 'session_metadata_changed', sessionId, changes: { taskNodeCount: count } }, managed.workspace.id)
+      const watcher = this.configWatchers.get(managed.workspace.rootPath)
+      watcher?.notifyFileChange(`sessions/${sessionId}/session.jsonl`)
+    }
+  }
+
+  /**
+   * Promote a hidden generate-time orchestrator (`taskDraft`) into the real, board-visible
+   * orchestrator for `taskSlug`. This is the single narrow path that lets "Generate → Create & Run"
+   * reuse the draft session instead of minting a second top-level tile (#bug1).
+   *
+   * Returns `true` on success (including an idempotent re-adopt of the same slug). Returns `false`
+   * — leaving the session untouched — when the session is missing, isn't a draft, or is already
+   * bound to a *different* slug. Callers fall back to `createSession` on `false`.
+   *
+   * Deliberately does NOT touch tools/sources/capabilities: the orchestrator keeps everything it
+   * was created with so it can still author/verify the run.
+   */
+  async adoptGeneratedTaskOrchestrator(
+    sessionId: string,
+    taskSlug: string,
+    reconcile?: { name?: string; projectId?: string; workingDirectory?: string; model?: string; llmConnection?: string; permissionMode?: PermissionMode },
+  ): Promise<boolean> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      sessionLog.warn('adoptGeneratedTaskOrchestrator: session not found', { sessionId, taskSlug })
+      return false
+    }
+    // Idempotency: already bound to this slug → no-op success. Bound to a different slug → refuse,
+    // so a stale draft ref can't hijack an unrelated orchestrator.
+    if (managed.taskSlug) {
+      if (managed.taskSlug === taskSlug) return true
+      sessionLog.warn('adoptGeneratedTaskOrchestrator: slug mismatch, refusing to rebind', {
+        sessionId, existing: managed.taskSlug, requested: taskSlug,
+      })
+      return false
+    }
+    // Only hidden generate-time drafts are eligible. A non-draft session without a slug isn't a
+    // generate orchestrator and must not be silently captured.
+    if (!managed.taskDraft) {
+      sessionLog.warn('adoptGeneratedTaskOrchestrator: session is not a task draft', { sessionId, taskSlug })
+      return false
+    }
+
+    // What actually changes — so we fire canonical live-updates (agent + caches + per-field events)
+    // only when needed. With generate now seeding model/connection/mode, these are usually all false.
+    const modelChanged = Boolean(reconcile?.model && reconcile.model !== managed.model)
+    const connectionChanged = Boolean(
+      reconcile?.llmConnection && !managed.connectionLocked && reconcile.llmConnection !== managed.llmConnection,
+    )
+    const cwdChanged = Boolean(reconcile?.workingDirectory && reconcile.workingDirectory !== managed.workingDirectory)
+    const modeChanged = Boolean(reconcile?.permissionMode && reconcile.permissionMode !== managed.permissionMode)
+
+    // Promote task metadata (no canonical mutator for these). Connection is set directly because
+    // setSessionConnection() refuses a session that has already sent messages (a generate draft has);
+    // the connection_changed event below keeps the renderer in sync.
+    managed.taskSlug = taskSlug
+    managed.taskDraft = false
+    if (reconcile?.projectId !== undefined) managed.projectId = reconcile.projectId
+    if (connectionChanged) managed.llmConnection = reconcile!.llmConnection
+    const renamed = Boolean(reconcile?.name && reconcile.name !== managed.name)
+    if (renamed) managed.name = reconcile!.name!
+
+    // Route model / cwd / permission mode through the canonical mutators so the LIVE agent, caches,
+    // and per-field events stay consistent — not just the on-disk metadata (the split-brain the
+    // follow-up review flagged). Each targets only the changed field; persist below captures the mode.
+    if (modelChanged) await this.updateSessionModel(sessionId, managed.workspace.id, reconcile!.model!)
+    if (cwdChanged) this.updateWorkingDirectory(sessionId, reconcile!.workingDirectory!)
+    if (modeChanged) this.setSessionPermissionMode(sessionId, reconcile!.permissionMode!)
+
+    this.setMetadataWriteGuard(managed)
+    this.persistSession(managed)
+    await this.flushSession(managed.id)
+
+    // One-shot board promotion: clearing taskDraft (sent as `false`, never `undefined` — undefined
+    // is dropped over the JSON wire) reveals the already-announced tile; taskSlug/projectId
+    // reconcile its metadata. `false` is falsy for the board's `if (meta.taskDraft)` skip.
+    const changes: { taskDraft: boolean; taskSlug: string; projectId?: string } = { taskDraft: false, taskSlug }
+    if (reconcile?.projectId !== undefined) changes.projectId = reconcile.projectId
+    this.sendEvent({ type: 'session_metadata_changed', sessionId, changes }, managed.workspace.id)
+    if (renamed) {
+      this.sendEvent({ type: 'name_changed', sessionId, name: managed.name }, managed.workspace.id)
+    }
+    if (connectionChanged) {
+      this.sendEvent({
+        type: 'connection_changed',
+        sessionId,
+        connectionSlug: managed.llmConnection!,
+        supportsBranching: resolveSupportsBranching(managed),
+      }, managed.workspace.id)
+    }
+    const watcher = this.configWatchers.get(managed.workspace.rootPath)
+    watcher?.notifyFileChange(`sessions/${sessionId}/session.jsonl`)
+    sessionLog.info('adoptGeneratedTaskOrchestrator: promoted draft', { sessionId, taskSlug, renamed, modelChanged, connectionChanged, cwdChanged, modeChanged })
+    return true
+  }
+
+  /**
+   * User-initiated bind of an *existing, visible* session (e.g. a quick-add tile) to a task slug.
+   *
+   * This is distinct from {@link adoptGeneratedTaskOrchestrator}, which is the narrow draft-only
+   * promotion path. A quick-add tile is a normal non-draft session with no `taskSlug`; the draft
+   * guard there correctly refuses it, so the editor's "save this spec onto this tile" flow needs
+   * its own path. The guard in the adopt method stays untouched.
+   *
+   * Returns `true` on success (including an idempotent re-bind of the same slug). Returns `false`
+   * — leaving the session untouched — when the session is missing, is a sub-session, or is already
+   * bound to a *different* slug. Callers MUST treat `false` as a hard error and must NOT fall back
+   * to creating a fresh orchestrator (that would mint a duplicate tile).
+   *
+   * Unlike adopt, this reconciles `llmConnection` too (a fresh create sets it; adopt skips it) so
+   * the bound tile doesn't render a stale backend.
+   */
+  async bindExistingSessionToTask(
+    sessionId: string,
+    taskSlug: string,
+    reconcile?: { name?: string; projectId?: string; workingDirectory?: string; model?: string; llmConnection?: string; permissionMode?: PermissionMode },
+  ): Promise<boolean> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      sessionLog.warn('bindExistingSessionToTask: session not found', { sessionId, taskSlug })
+      return false
+    }
+    // Tasks are one level deep, so a sub-session can't orchestrate. Checked before the slug: the
+    // Conductor's children carry their task's slug, which the idempotent re-bind would accept.
+    if (managed.parentSessionId) {
+      sessionLog.warn('bindExistingSessionToTask: refusing a sub-session', {
+        sessionId, taskSlug, parentSessionId: managed.parentSessionId,
+      })
+      return false
+    }
+    if (managed.taskSlug) {
+      if (managed.taskSlug === taskSlug) return true
+      sessionLog.warn('bindExistingSessionToTask: slug mismatch, refusing to rebind', {
+        sessionId, existing: managed.taskSlug, requested: taskSlug,
+      })
+      return false
+    }
+
+    // What actually changes — so we fire canonical live-updates (agent + caches + per-field events)
+    // only when needed. A quick-add tile is already live, so these keep its running agent in step.
+    const modelChanged = Boolean(reconcile?.model && reconcile.model !== managed.model)
+    const connectionChanged = Boolean(
+      reconcile?.llmConnection && !managed.connectionLocked && reconcile.llmConnection !== managed.llmConnection,
+    )
+    const cwdChanged = Boolean(reconcile?.workingDirectory && reconcile.workingDirectory !== managed.workingDirectory)
+    const modeChanged = Boolean(reconcile?.permissionMode && reconcile.permissionMode !== managed.permissionMode)
+
+    // Promote task metadata (no canonical mutator for these). Connection is set directly because
+    // setSessionConnection() refuses a session that has already sent messages (a quick-add tile has);
+    // the connection_changed event below keeps the renderer in sync.
+    managed.taskSlug = taskSlug
+    managed.taskDraft = false
+    if (reconcile?.projectId !== undefined) managed.projectId = reconcile.projectId
+    if (connectionChanged) managed.llmConnection = reconcile!.llmConnection
+    const renamed = Boolean(reconcile?.name && reconcile.name !== managed.name)
+    if (renamed) managed.name = reconcile!.name!
+
+    // Route model / cwd / permission mode through the canonical mutators so the LIVE agent, caches,
+    // and per-field events stay consistent — not just the on-disk metadata (the split-brain the
+    // follow-up review flagged). updateSessionModel emits session_model_changed itself.
+    if (modelChanged) await this.updateSessionModel(sessionId, managed.workspace.id, reconcile!.model!)
+    if (cwdChanged) this.updateWorkingDirectory(sessionId, reconcile!.workingDirectory!)
+    if (modeChanged) this.setSessionPermissionMode(sessionId, reconcile!.permissionMode!)
+
+    this.setMetadataWriteGuard(managed)
+    this.persistSession(managed)
+    await this.flushSession(managed.id)
+
+    const changes: { taskDraft: boolean; taskSlug: string; projectId?: string } = { taskDraft: false, taskSlug }
+    if (reconcile?.projectId !== undefined) changes.projectId = reconcile.projectId
+    this.sendEvent({ type: 'session_metadata_changed', sessionId, changes }, managed.workspace.id)
+    if (renamed) {
+      this.sendEvent({ type: 'name_changed', sessionId, name: managed.name }, managed.workspace.id)
+    }
+    if (connectionChanged) {
+      this.sendEvent({
+        type: 'connection_changed',
+        sessionId,
+        connectionSlug: managed.llmConnection!,
+        supportsBranching: resolveSupportsBranching(managed),
+      }, managed.workspace.id)
+    }
+    const watcher = this.configWatchers.get(managed.workspace.rootPath)
+    watcher?.notifyFileChange(`sessions/${sessionId}/session.jsonl`)
+    sessionLog.info('bindExistingSessionToTask: bound existing session', { sessionId, taskSlug, renamed, modelChanged, connectionChanged, cwdChanged, modeChanged })
+    return true
   }
 
   /**
@@ -6697,6 +8558,189 @@ export class SessionManager implements ISessionManager {
       // Persist to disk
       this.persistSession(managed)
     }
+  }
+
+  /**
+   * Turn coding mode on or off: the lean coding system prompt and session-tool profile.
+   * Only before the conversation starts (see {@link hasConversationStarted}); after that the UI
+   * offers to continue in a new session instead, so this throws.
+   */
+  setSessionCodingMode(sessionId: string, enabled: boolean): void {
+    const managed = this.sessions.get(sessionId)
+    if (!managed || !!managed.codingMode === enabled) return
+    if (hasConversationStarted(managed)) {
+      throw new Error('Coding mode is fixed once a session has messages. Continue in a new session to switch it.')
+    }
+
+    // Stored only when on, so sessions that never use it keep an unchanged header
+    managed.codingMode = enabled || undefined
+    managed.agent?.setAgentProfile(enabled ? 'coding' : 'default')
+
+    sessionLog.info(`Session ${sessionId}: coding mode ${enabled ? 'on' : 'off'}`)
+    this.persistSession(managed)
+    this.sendEvent({ type: 'coding_mode_changed', sessionId, codingMode: enabled }, managed.workspace.id)
+  }
+
+  /**
+   * Continue a started session in a new one with coding mode set to `codingMode` (coding mode is
+   * fixed once a conversation starts, see {@link setSessionCodingMode}). The new session keeps the
+   * working directory, model, connection, thinking level, permission mode, sources and project, and
+   * gets a summary of this conversation as one-shot hidden context on its first turn (the same
+   * handoff remote transfers use). The source session is left untouched.
+   *
+   * The summary is a model call that takes seconds, so the new session is returned at once and the
+   * summary is attached in the background (`attachHandoffSummary`); a first message sent before it
+   * is ready waits for it in `sendMessage`.
+   */
+  async continueSessionInNewSession(sessionId: string, codingMode: boolean): Promise<{ sessionId: string }> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) throw new Error(`Session ${sessionId} not found`)
+
+    const session = await this.createSession(managed.workspace.id, {
+      permissionMode: managed.permissionMode,
+      thinkingLevel: managed.thinkingLevel,
+      workingDirectory: managed.workingDirectory ?? 'none',
+      model: managed.model,
+      llmConnection: managed.llmConnection,
+      enabledSourceSlugs: managed.enabledSourceSlugs,
+      projectId: managed.projectId,
+      codingMode,
+    })
+
+    const created = this.sessions.get(session.id)
+    if (created) {
+      const pending: Promise<void> = this.attachHandoffSummary(managed, created).finally(() => {
+        if (created.pendingHandoffSummary === pending) created.pendingHandoffSummary = undefined
+      })
+      created.pendingHandoffSummary = pending
+    }
+    sessionLog.info(`Session ${sessionId}: continued in ${session.id} with coding mode ${codingMode ? 'on' : 'off'}; summarizing the conversation in the background`)
+    return { sessionId: session.id }
+  }
+
+  /** Wait for a continued session's handoff summary, at most `handoffSummaryWaitMs`. */
+  private async waitForHandoffSummary(managed: ManagedSession): Promise<void> {
+    const pending = managed.pendingHandoffSummary
+    if (!pending) return
+    const startedAt = Date.now()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const ready = await Promise.race([
+      pending.then(() => true),
+      new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), this.handoffSummaryWaitMs) }),
+    ])
+    clearTimeout(timer)
+    sessionLog.info(`Session ${managed.id}: first turn waited ${Date.now() - startedAt} ms for the previous session's summary${ready ? '' : ', starting without it'}`)
+  }
+
+  /**
+   * Summarize `source`'s conversation and give it to `target` as one-shot hidden context for its
+   * first turn (`transferredSessionSummary`). Never throws: without a summary the new session just
+   * starts without the earlier context.
+   */
+  private async attachHandoffSummary(source: ManagedSession, target: ManagedSession): Promise<void> {
+    const startedAt = Date.now()
+    try {
+      const summary = await this.generateSessionHandoffSummary(source)
+      // Deleted while the summary was generated
+      if (this.sessions.get(target.id) !== target) return
+      if (summary) {
+        target.transferredSessionSummary = summary
+        target.transferredSessionSummaryApplied = false
+        this.persistSession(target)
+        await sessionPersistenceQueue.flush(target.id)
+      }
+      sessionLog.info(`Session ${target.id}: summary of ${source.id} ${summary ? `ready (${summary.length} chars)` : 'empty'} after ${Date.now() - startedAt} ms`)
+    } catch (error) {
+      sessionLog.warn(`Session ${target.id}: summary of ${source.id} failed after ${Date.now() - startedAt} ms:`, error)
+    }
+  }
+
+  /** Coding mode: PRs pinned to a session (chat-header PR carousel), in addedAt order. */
+  getSessionBoundPrs(sessionId: string): BoundPr[] {
+    return this.sessions.get(sessionId)?.boundPrs ?? []
+  }
+
+  /**
+   * Pin a PR to a session (pr_bind). Deduped by host/owner/repo#number — re-binding an existing PR
+   * refreshes its position — then persisted. Returns the new list (addedAt order).
+   */
+  bindPrToSession(sessionId: string, pr: BoundPr): BoundPr[] {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) throw new Error(`Session ${sessionId} not found`)
+    const next = [...(managed.boundPrs ?? []).filter(p => !sameBoundPr(p, pr)), pr].sort((a, b) => a.addedAt - b.addedAt)
+    managed.boundPrs = next
+    sessionLog.info(`Session ${sessionId}: bound PR ${pr.owner}/${pr.repo}#${pr.number} (${next.length} total)`)
+    this.persistSession(managed)
+    return next
+  }
+
+  /** Remove a pinned PR from a session (pr_unbind); persists and returns the new list. */
+  unbindPrFromSession(sessionId: string, pr: { host: string; owner: string; repo: string; number: number }): BoundPr[] {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) throw new Error(`Session ${sessionId} not found`)
+    const next = (managed.boundPrs ?? []).filter(p => !sameBoundPr(p, pr))
+    // Stored only when non-empty, so sessions that never bind keep an unchanged header (like codingMode)
+    managed.boundPrs = next.length ? next : undefined
+    // An unbound PR's auto-fix goes with it
+    const monitorId = prEntryId(pr)
+    if (managed.prMonitors?.[monitorId]) {
+      const { [monitorId]: _dropped, ...rest } = managed.prMonitors
+      managed.prMonitors = Object.keys(rest).length ? rest : undefined
+    }
+    sessionLog.info(`Session ${sessionId}: unbound PR ${pr.owner}/${pr.repo}#${pr.number} (${next.length} left)`)
+    this.persistSession(managed)
+    return next
+  }
+
+  /** Coding mode: per-PR monitor state (auto-fix), keyed by PR id. */
+  getSessionPrMonitors(sessionId: string): Record<string, PrMonitorState> {
+    return this.sessions.get(sessionId)?.prMonitors ?? {}
+  }
+
+  /**
+   * Turn auto-fix (the PR card's Fix toggle) on or off for one PR of a session; persists and returns
+   * the monitors. Turning it off keeps what the last run acted on, so turning it back on only fixes
+   * feedback that is new since then.
+   */
+  setSessionPrAutoFix(sessionId: string, prId: string, enabled: boolean): Record<string, PrMonitorState> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) throw new Error(`Session ${sessionId} not found`)
+    const monitors = { ...(managed.prMonitors ?? {}) }
+    const entry: PrMonitorState = { ...(monitors[prId] ?? {}), autoFix: enabled || undefined }
+    if (entry.autoFix || entry.lastFixAt) monitors[prId] = entry
+    else delete monitors[prId]
+    managed.prMonitors = Object.keys(monitors).length ? monitors : undefined
+    sessionLog.info(`Session ${sessionId}: auto-fix ${enabled ? 'on' : 'off'} for ${prId}`)
+    this.persistSession(managed)
+    return managed.prMonitors ?? {}
+  }
+
+  /** Record an auto-fix run: when, and the review feedback (signature) it acted on. */
+  recordPrAutoFixRun(sessionId: string, prId: string, signature: string[], at: number): void {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) return
+    managed.prMonitors = { ...(managed.prMonitors ?? {}), [prId]: { ...(managed.prMonitors?.[prId] ?? {}), lastFixAt: at, lastFixSignature: signature } }
+    this.persistSession(managed)
+  }
+
+  /** A session's metadata without loading its messages (cheap, unlike getSession). */
+  getSessionSnapshot(sessionId: string): Session | null {
+    const managed = this.sessions.get(sessionId)
+    return managed ? managedToSession(managed) : null
+  }
+
+  /**
+   * Start a turn in an idle session with an app-generated notice: hidden (never a transcript bubble)
+   * and labelled as sent by Craft Agents, not the user — the same path background-task completions
+   * use. Returns false, sending nothing, when the session is missing or busy, so the caller can retry.
+   */
+  wakeIdleSessionWithNotice(sessionId: string, text: string): boolean {
+    const managed = this.sessions.get(sessionId)
+    if (!managed || managed.isProcessing) return false
+    void this.sendMessage(sessionId, labelSystemNotice(text), [], [], { hidden: true }).catch((err) => {
+      sessionLog.error(`Session ${sessionId}: failed to start a system-notice turn:`, err)
+    })
+    return true
   }
 
   /**
@@ -6728,6 +8772,7 @@ export class SessionManager implements ISessionManager {
 
         agent = createBackendFromConnection(managed.llmConnection, {
           workspace: managed.workspace,
+          model: managed.model,
           miniModel: connection ? (getMiniModel(connection) ?? connection.defaultModel) : undefined,
           session: {
             id: `title-${managed.id}`,
@@ -6753,11 +8798,21 @@ export class SessionManager implements ISessionManager {
     }
 
     try {
-      const genLangCode = (i18n.resolvedLanguage ?? 'en') as LanguageCode
-      const genLangEntry = LOCALE_REGISTRY[genLangCode]
-      const title = await agent.generateTitle(userMessage, { language: genLangEntry?.nativeName })
-      if (title) {
+      // Race-free language resolution from persisted UI language; undefined => auto-detect (#885).
+      const titleLanguage = resolveTitleLanguageName()
+      sessionLog.info(`[generateTitle] language at call time`, {
+        sessionId: managed.id,
+        persistedUiLanguage: getPersistedUiLanguage() ?? null,
+        resolvedLanguage: i18n.resolvedLanguage ?? null,
+        titleLanguage: titleLanguage ?? null,
+      })
+      const title = await agent.generateTitle(userMessage, { language: titleLanguage })
+      if (title && managed.autoTitle !== undefined && managed.name !== managed.autoTitle) {
+        // Renamed while the title was generating: the user's (or an external) name wins.
+        sessionLog.info(`[generateTitle] Session ${managed.id} was renamed meanwhile, keeping "${managed.name}"`)
+      } else if (title) {
         managed.name = title
+        managed.autoTitle = title
         this.persistSession(managed)
         // Flush immediately to ensure disk is up-to-date before notifying renderer.
         // This prevents race condition where lazy loading reads stale disk data
@@ -6798,12 +8853,71 @@ export class SessionManager implements ISessionManager {
   private async processEvent(managed: ManagedSession, event: AgentEvent): Promise<void> {
     const sessionId = managed.id
     const workspaceId = managed.workspace.id
+    this.notifySessionActivity(sessionId)
 
     switch (event.type) {
       case 'text_delta':
         managed.streamingText += event.text
+        managed.streamingTurnId = event.turnId
         // Queue delta for batched sending (performance: reduces IPC from 50+/sec to ~20/sec)
         this.queueDelta(sessionId, workspaceId, event.text, event.turnId)
+        break
+
+      case 'text_discard':
+        // Discard, NEVER flush, the failed attempt's batch before announcing
+        // backoff. Otherwise a delayed failed token can arrive after retry start.
+        this.discardDelta(sessionId, event.turnId)
+        if (managed.streamingTurnId === event.turnId) {
+          managed.streamingText = ''
+          managed.streamingTurnId = undefined
+        }
+        this.sendEvent({ ...event, sessionId }, workspaceId)
+        break
+
+      case 'messages_retracted': {
+        // A reply the backend took back (Claude: one the model's safeguards stopped, which a fallback
+        // model answers instead). Unfinished text went with a text_discard just before.
+        for (const turnId of event.turnIds) this.discardDelta(sessionId, turnId)
+        if (managed.streamingTurnId && event.turnIds.includes(managed.streamingTurnId)) {
+          managed.streamingText = ''
+          managed.streamingTurnId = undefined
+        }
+        const kept = withoutRetractedMessages(managed.messages, event)
+        if (kept.length !== managed.messages.length) {
+          managed.messages = kept
+          if (managed.lastFinalMessageId && !kept.some(m => m.id === managed.lastFinalMessageId)) {
+            managed.lastFinalMessageId = kept.findLast(m => m.role === 'assistant' && !m.isIntermediate)?.id
+          }
+          this.persistSession(managed)
+        }
+        this.sendEvent({ type: 'messages_retracted', sessionId, turnIds: event.turnIds, toolUseIds: event.toolUseIds }, workspaceId)
+        break
+      }
+
+      case 'model_refusal': {
+        // The model's safeguards stopped a reply: say so where it happened, and when the backend goes
+        // on with another model, make that the session's model (the model picker shows it, and picking
+        // the old one again switches back)
+        const notice: Message = {
+          id: generateMessageId(),
+          role: 'info',
+          content: event.message,
+          timestamp: this.monotonic(),
+          infoLevel: 'warning',
+        }
+        managed.messages.push(notice)
+        this.persistSession(managed)
+        this.sendEvent({ type: 'info', sessionId, message: event.message, level: 'warning', timestamp: notice.timestamp }, workspaceId)
+        if (event.fallbackModel && event.fallbackModel !== managed.model) {
+          sessionLog.info(`Session ${sessionId}: the model's safeguards stopped a reply; continuing on ${event.fallbackModel}`)
+          await this.updateSessionModel(sessionId, workspaceId, event.fallbackModel)
+        }
+        break
+      }
+
+      case 'retry':
+        // Retry progress is transient; do not persist it as transcript history.
+        this.sendEvent({ ...event, sessionId }, workspaceId)
         break
 
       case 'text_complete': {
@@ -6821,6 +8935,7 @@ export class SessionManager implements ISessionManager {
         }
         managed.messages.push(assistantMessage)
         managed.streamingText = ''
+        managed.streamingTurnId = undefined
 
         // Update lastMessageRole and lastFinalMessageId for badge/unread display (only for final messages)
         if (!event.isIntermediate) {
@@ -6888,8 +9003,10 @@ export class SessionManager implements ISessionManager {
       }
 
       case 'tool_start': {
+        this.noteSuggestionUse(managed, { toolName: event.toolName, input: event.input })
+        noteLargeResultFileUse(managed.id, event.input)
         // Format tool input paths to relative for better readability
-        const formattedToolInput = formatToolInputPaths(event.input)
+        const formattedToolInput = formatToolInputPaths(event.input, managed.workingDirectory)
 
         // Resolve call_llm model for TurnCard badge display.
         // Resolve call_llm model short names to full IDs for display.
@@ -7022,7 +9139,7 @@ export class SessionManager implements ISessionManager {
         const toolName = event.toolName || 'unknown'
 
         // Format absolute paths to relative paths for better readability
-        const rawFormattedResult = event.result ? formatPathsToRelative(event.result) : ''
+        const rawFormattedResult = event.result ? formatPathsToRelative(event.result, managed.workingDirectory) : ''
 
         // Safety net: prevent massive tool results from bloating session JSONL (protects all backends)
         const MAX_PERSISTED_RESULT_CHARS = 200_000 // ~50K tokens
@@ -7044,11 +9161,18 @@ export class SessionManager implements ISessionManager {
         // parentToolUseId comes from CraftAgent (SDK-authoritative) or existing message
         const parentToolUseId = existingToolMsg?.parentToolUseId || event.parentToolUseId
 
+        // A browser_tool fill's input still holds the typed value; once the result says the
+        // field was a password, keep the value out of the transcript (stored, shown, shared).
+        const redactedToolInput = existingToolMsg
+          ? redactBrowserPasswordFills(existingToolMsg.toolName || toolName, existingToolMsg.toolInput, event.result)
+          : undefined
+
         if (existingToolMsg) {
           // Keep lightweight status text in `content` and store full payload in `toolResult` only.
           existingToolMsg.toolResult = formattedResult
           existingToolMsg.toolStatus = inferredError ? 'error' : 'completed'
           existingToolMsg.isError = inferredError
+          if (redactedToolInput) existingToolMsg.toolInput = redactedToolInput
           // If message doesn't have parent set, use event's parentToolUseId
           if (!existingToolMsg.parentToolUseId && event.parentToolUseId) {
             existingToolMsg.parentToolUseId = event.parentToolUseId
@@ -7079,10 +9203,11 @@ export class SessionManager implements ISessionManager {
           managed.messages.push(toolMessage)
         }
 
-        // Send event to renderer if: (a) first completion, or (b) result content changed
-        // (e.g., safety net auto-completed with empty result, then real result arrived later)
+        // Send event to renderer if: (a) first completion, (b) result content changed
+        // (e.g., safety net auto-completed with empty result, then real result arrived later),
+        // or (c) the input was redacted, so the renderer replaces its copy from tool_start
         const resultChanged = wasAlreadyComplete && formattedResult && existingToolMsg?.toolResult !== formattedResult
-        if (!wasAlreadyComplete || resultChanged) {
+        if (!wasAlreadyComplete || resultChanged || redactedToolInput) {
           // Use existing tool message timestamp, or fallback message timestamp for ordering
           const toolResultTimestamp = existingToolMsg?.timestamp ?? (managed.messages.find(m => m.toolUseId === event.toolUseId)?.timestamp)
           this.sendEvent({
@@ -7095,6 +9220,7 @@ export class SessionManager implements ISessionManager {
             parentToolUseId,
             isError: inferredError,
             timestamp: toolResultTimestamp,
+            ...(redactedToolInput ? { toolInput: redactedToolInput } : {}),
           }, workspaceId)
         }
 
@@ -7129,6 +9255,9 @@ export class SessionManager implements ISessionManager {
       }
 
       case 'status':
+        // A stopped turn already shows "Response interrupted"; a late backend status (e.g. the
+        // agent's own "Interrupted") would only leave a stray streaming row behind.
+        if (managed?.stopRequested) break
         this.sendEvent({
           type: 'status',
           sessionId,
@@ -7139,10 +9268,12 @@ export class SessionManager implements ISessionManager {
 
       case 'info': {
         const isCompactionComplete = event.message.startsWith('Compacted')
+        const isManualCompactionComplete = isCompactionComplete && event.compactionTrigger === 'manual'
         const infoTimestamp = this.monotonic()
 
-        // Persist compaction messages so they survive reload
-        // Other info messages are transient (just sent to renderer)
+        // Persist compaction messages so they survive reload. Only a manual
+        // command-correlated success marks Accept & Compact ready; automatic
+        // compaction and SDK false-success command results must not execute a plan.
         if (isCompactionComplete) {
           const compactionMessage: Message = {
             id: generateMessageId(),
@@ -7153,24 +9284,10 @@ export class SessionManager implements ISessionManager {
           }
           managed.messages.push(compactionMessage)
 
-          // Mark compaction complete in the session state.
-          // This is done here (backend) rather than in the renderer so it's
-          // not affected by CMD+R during compaction. The frontend reload
-          // recovery will see awaitingCompaction=false and trigger execution.
-          void markStoredCompactionComplete(managed.workspace.rootPath, sessionId)
-          sessionLog.info(`Session ${sessionId}: compaction complete, marked pending plan ready`)
-
-          // Emit usage_update so the context count badge refreshes immediately
-          // after compaction, without waiting for the next message
-          if (managed.tokenUsage) {
-            this.sendEvent({
-              type: 'usage_update',
-              sessionId,
-              tokenUsage: {
-                inputTokens: managed.tokenUsage.inputTokens,
-                contextWindow: managed.tokenUsage.contextWindow,
-              },
-            }, workspaceId)
+          if (isManualCompactionComplete) {
+            if (managed.pendingPlanExecution) managed.pendingPlanExecution.awaitingCompaction = false
+            await markStoredCompactionComplete(managed.workspace.rootPath, sessionId)
+            sessionLog.info(`Session ${sessionId}: manual compaction complete, marked pending plan ready`)
           }
         }
 
@@ -7286,16 +9403,108 @@ export class SessionManager implements ISessionManager {
         break
 
       case 'task_backgrounded':
-      case 'task_progress':
-        // Forward background task events directly to renderer
+        // Record in the running-task registry so a cross-subprocess "status?"
+        // query can enumerate live tasks (WS3). The renderer still shows the
+        // chip via its own atom; this is the main-process source of truth.
+        if (managed) {
+          managed.backgroundTaskRegistry.set(event.taskId, {
+            taskId: event.taskId,
+            toolUseId: event.toolUseId,
+            intent: event.intent,
+            startTime: Date.now(),
+            status: 'running',
+            turnId: event.turnId,
+            kind: event.kind === 'workflow' ? 'workflow' : event.kind === 'task' ? 'task' : 'agent',
+            // Workflow launches carry a wf_ id + a live sub-agent completion count.
+            ...(event.workflowId ? { workflowId: event.workflowId } : {}),
+            ...(event.kind === 'workflow' ? { agentsCompleted: 0 } : {}),
+          })
+          sessionLog.info(`[bg-lifecycle] task backgrounded`, {
+            sessionId,
+            taskId: event.taskId,
+            intent: event.intent,
+            turnId: event.turnId,
+          })
+        }
+        // Forward background task event directly to renderer
         this.sendEvent({
           ...event,
           sessionId,
         }, workspaceId)
         break
 
-      case 'task_completed':
-        // Store output for later retrieval via getTaskOutput()
+      case 'workflow_agent_completed':
+        // One sub-agent of a running Workflow finished (SubagentStop, attributed
+        // by wf_ id). Bump the owning workflow chip's completed count so the user
+        // sees live fan-out progress. Lightweight: registry counter + renderer
+        // forward, no persistence (this can fire dozens of times per workflow).
+        if (managed) {
+          for (const info of managed.backgroundTaskRegistry.values()) {
+            if (info.workflowId && info.workflowId === event.workflowId) {
+              info.agentsCompleted = (info.agentsCompleted ?? 0) + 1
+              break
+            }
+          }
+        }
+        this.sendEvent({
+          ...event,
+          sessionId,
+        }, workspaceId)
+        break
+
+      case 'task_activity': {
+        // What a running background task is doing (the chip card's live line). Only tasks with a chip
+        // (registered launches) are forwarded: a foreground subagent reports progress too.
+        const info = managed?.backgroundTaskRegistry.get(event.taskId)
+        if (!info || info.untracked) break
+        info.lastProgressAt = Date.now()
+        this.sendEvent({
+          ...event,
+          sessionId,
+        }, workspaceId)
+        break
+      }
+
+      case 'task_progress':
+        // Update elapsed/last-progress on the registry entry (best-effort — the
+        // async-by-default path may not emit progress; the renderer derives
+        // elapsed from startTime as a fallback).
+        if (managed) {
+          // task_progress is keyed by toolUseId, not taskId — find the entry.
+          for (const info of managed.backgroundTaskRegistry.values()) {
+            if (info.toolUseId && info.toolUseId === event.toolUseId) {
+              info.elapsedSeconds = event.elapsedSeconds
+              info.lastProgressAt = Date.now()
+              break
+            }
+          }
+        }
+        // Forward background task event directly to renderer
+        this.sendEvent({
+          ...event,
+          sessionId,
+        }, workspaceId)
+        break
+
+      case 'task_completed': {
+        // Capture whether we'd already recorded a terminal result for this task
+        // BEFORE mutating state below, so the idle auto-surface (further down)
+        // fires at most once even if a duplicate terminal notification arrives.
+        // A Workflow's completion notification may key on either the returned
+        // Task ID (the registry key) or the wf_ run id, so fall back to a
+        // workflowId match before giving up.
+        const priorEntry = managed
+          ? (managed.backgroundTaskRegistry.get(event.taskId)
+            ?? [...managed.backgroundTaskRegistry.values()].find(t => t.workflowId === event.taskId))
+          : undefined
+        // Only the session's own tasks may wake it below: one registered at launch and still
+        // running, or (launch unseen) one whose starting tool call was the agent's own. A
+        // completion for anything else (a subagent's task) is recorded, never surfaced.
+        const launchedHereAndRunning = priorEntry
+          ? priorEntry.status === 'running' && !priorEntry.untracked
+          : event.launchedHere === true
+
+        // Store the output file for the chip's card (getBackgroundTaskOutput) and the wake-up nudge
         if (managed) {
           managed.backgroundTaskOutputs.set(event.taskId, {
             outputFile: event.outputFile || '',
@@ -7303,32 +9512,133 @@ export class SessionManager implements ISessionManager {
             status: event.status,
             completedAt: Date.now(),
           })
-          // O(1) index for getTaskOutput() — avoids scanning all sessions
-          this.taskOutputIndex.set(event.taskId, sessionId)
-          sessionLog.info(`Background task ${event.taskId} completed (status=${event.status})`)
 
-          // Evict stale entries older than 1 hour to bound memory growth
-          const ONE_HOUR = 3_600_000
-          const now = Date.now()
-          for (const [tid, info] of managed.backgroundTaskOutputs) {
-            if (now - info.completedAt > ONE_HOUR) {
-              managed.backgroundTaskOutputs.delete(tid)
-              this.taskOutputIndex.delete(tid)
-            }
+          // Resolve the running-task registry entry to its terminal status so a
+          // later "status?" query reflects reality instead of a stale "running".
+          // Match by taskId, or by workflowId (a workflow may complete under its
+          // wf_ run id rather than the returned Task ID).
+          const running = managed.backgroundTaskRegistry.get(event.taskId)
+            ?? [...managed.backgroundTaskRegistry.values()].find(t => t.workflowId === event.taskId)
+          if (running) {
+            running.status = event.status
+            running.completedAt = Date.now()
+          } else {
+            // Terminal notification for a task whose launch this session never registered: a
+            // subagent's own background task (untracked), or the agent's own task whose launch went
+            // unseen. Record it so status queries stay truthful, without inventing a start time.
+            const now = Date.now()
+            managed.backgroundTaskRegistry.set(event.taskId, {
+              taskId: event.taskId,
+              ...(event.toolUseId ? { toolUseId: event.toolUseId } : {}),
+              startTime: now,
+              status: event.status,
+              completedAt: now,
+              ...(event.launchedHere ? { startUnknown: true } : { untracked: true }),
+            })
           }
+          sessionLog.info(`[bg-lifecycle] task completed`, {
+            sessionId,
+            taskId: event.taskId,
+            status: event.status,
+          })
+
+          this.evictStaleBackgroundTasks(managed)
         }
         // Forward to renderer for UI update
         this.sendEvent({
           ...event,
           sessionId,
         }, workspaceId)
+
+        // WS2 keep-alive: when a background agent finishes while the session is
+        // IDLE, nobody is consuming its result — the main agent already ended its
+        // turn, so the completion only updates the registry/chip and the findings
+        // never make it back into the conversation ("the agent never returned the
+        // result"). Wake the session with a system-generated follow-up so the agent
+        // reads the output and presents it. During an active turn (isProcessing)
+        // the terminal notification reaches the agent through the live stream, so
+        // we skip then. Gated on keep-alive because only that mode delivers this
+        // event between turns; guarded against duplicate notifications.
+        // A stop the user asked for from the chip is not news to report back: it wakes nothing. A task
+        // step still wakes, since its run waits for the turn that follows its background work.
+        const stoppedByUser = event.status === 'stopped' && !!priorEntry?.stopRequestedAt && !managed?.taskRunId
+        if (managed && this.keepBackgroundTasksAlive && !managed.isProcessing && launchedHereAndRunning && !stoppedByUser) {
+          const taskIntent = priorEntry?.intent
+          const outputFile = event.outputFile || managed.backgroundTaskOutputs.get(event.taskId)?.outputFile
+          const label = taskIntent ? `"${taskIntent}"` : `task ${event.taskId}`
+          const kind = priorEntry?.kind
+          const what = kind === 'shell' ? 'background command' : kind === 'task' ? 'background task' : 'background agent'
+          const nudge = kind === 'shell' || kind === 'task'
+            ? (event.status === 'completed'
+              ? [
+                  `[background-task-completed] The ${what} you started (${label}) has finished.`,
+                  outputFile ? `Its output is saved at: ${outputFile}` : '',
+                  `Read that output and report the result to the user now. Do NOT start it again.`,
+                ].filter(Boolean).join('\n')
+              : [
+                  `[background-task-${event.status}] The ${what} you started (${label}) ended with status "${event.status}".`,
+                  outputFile ? `Any partial output is at: ${outputFile}.` : '',
+                  `Briefly let the user know it did not complete successfully.`,
+                ].filter(Boolean).join('\n'))
+            : event.status === 'completed'
+            // An agent's output file is its whole transcript (JSONL): reading it floods the context, and
+            // the SDK's task notification already carries the result.
+            ? [
+                `[background-task-completed] The background agent you launched (${label}) has finished.`,
+                `Its result is in the task notification. Present it to the user now, inline. Do NOT spawn another background agent.`,
+                outputFile ? `Its output file (${outputFile}) is the agent's full transcript: do not read it whole; if the notification lacks something, read only its end.` : '',
+              ].filter(Boolean).join('\n')
+            : [
+                `[background-task-${event.status}] The background agent you launched (${label}) ended with status "${event.status}".`,
+                outputFile ? `Any partial output is at: ${outputFile}.` : '',
+                `Briefly let the user know it did not complete successfully. Do NOT spawn another background agent.`,
+              ].filter(Boolean).join('\n')
+          sessionLog.info(`[bg-lifecycle] surfacing completed background task to idle session`, {
+            sessionId,
+            taskId: event.taskId,
+            status: event.status,
+          })
+          // Ride the normal turn machinery (resume + persistence). `hidden: true`
+          // keeps the nudge out of the transcript — the agent's response (the
+          // presented result) renders as a normal assistant turn.
+          // It rides in as a user message, so say plainly that nobody typed it: agents took
+          // these for the user speaking, mid-task (found 2026-10-11).
+          const framed = labelSystemNotice(nudge)
+          void this.sendMessage(sessionId, framed, [], [], { hidden: true }).catch((err) => {
+            sessionLog.error(`[bg-lifecycle] failed to surface completed task ${event.taskId}:`, err)
+          })
+        }
         break
+      }
 
       case 'shell_backgrounded':
-        // Store the command for later process killing
-        if (event.command && managed) {
-          managed.backgroundShellCommands.set(event.shellId, event.command)
-          sessionLog.info(`Stored command for shell ${event.shellId}: ${event.command.slice(0, 50)}...`)
+        // Track the agent's background command like a background agent (its shell id is the task
+        // id its completion notification carries): real start time and intent in status queries,
+        // and its completion can wake an idle session.
+        if (managed) {
+          const known = managed.backgroundTaskRegistry.get(event.shellId)
+          const intent = event.intent ?? event.command?.slice(0, 120)
+          if (known) {
+            // It already finished (fast command): keep the terminal status, fill in what we know.
+            // It is the agent's own after all, but its real start time was not seen.
+            known.kind = 'shell'
+            known.toolUseId ??= event.toolUseId
+            known.intent ??= intent
+            if (known.untracked) {
+              known.untracked = false
+              known.startUnknown = true
+            }
+          } else {
+            managed.backgroundTaskRegistry.set(event.shellId, {
+              taskId: event.shellId,
+              toolUseId: event.toolUseId,
+              ...(intent ? { intent } : {}),
+              startTime: Date.now(),
+              status: 'running',
+              turnId: event.turnId,
+              kind: 'shell',
+            })
+          }
         }
         // Forward to renderer
         this.sendEvent({
@@ -7353,14 +9663,23 @@ export class SessionManager implements ISessionManager {
         }, workspaceId)
 
         if (!managed) break
+        this.noteSuggestionUse(managed, { activatedSource: event.sourceSlug })
 
-        const originalMessage = event.originalMessage ?? ''
-        if (!originalMessage.trim()) {
-          sessionLog.warn(`Source "${event.sourceSlug}" activated for session ${sessionId}, but originalMessage was empty; skipping auto-retry`)
+        // The captured original message can be empty — an empty/attachment-only turn,
+        // or a per-turn capture that raced turn teardown. Fall back to the last
+        // persisted user message so an activation that ended the turn still
+        // continues; skip only when there is genuinely nothing to resend (preserves
+        // the "no bogus empty resend" intent). See bugfix/session-continuation.
+        const capturedMessage = event.originalMessage ?? ''
+        const resendMessage = capturedMessage.trim()
+          ? capturedMessage
+          : lastUserMessageContent(managed.messages)
+        if (!resendMessage.trim()) {
+          sessionLog.warn(`Source "${event.sourceSlug}" activated for session ${sessionId}, but no message to resend (empty capture, no prior user message); skipping auto-retry`)
           break
         }
 
-        const messageWithSuffix = `${originalMessage}\n\n[${event.sourceSlug} activated]`
+        const { plain: messageWithSuffix, retry: retryMessage } = buildActivationRetryMessage(resendMessage, managed.turnSteers ?? [], event.sourceSlug)
         const messageCountAtSchedule = managed.messages.length
 
         // Stash the retry payload so a duplicate sendMessage from a legacy renderer
@@ -7389,12 +9708,46 @@ export class SessionManager implements ISessionManager {
           // so a legacy renderer's duplicate RPC arriving ~50ms later gets dropped.
           // The pending slot is cleared by the deadline check in sendMessage, by the
           // next matching sendMessage that drops as a duplicate, or by session deletion.
-          this.sendMessage(sessionId, messageWithSuffix).catch(err => {
+          // Hidden: the user already sees their message and the activation; the retry only
+          // restarts the turn with the new tools (and runs no per-message decision points).
+          current.pendingActivationResend = retryMessage
+          this.sendMessage(sessionId, retryMessage, undefined, undefined, { hidden: true }).catch(err => {
+            if (current.pendingActivationResend === retryMessage) current.pendingActivationResend = undefined
             sessionLog.error(`Auto-retry sendMessage failed for ${sessionId}:`, err)
           })
         }, 100)
         break
       }
+
+      case 'context_usage': {
+        if (!managed.tokenUsage) {
+          managed.tokenUsage = {
+            inputTokens: 0,
+            outputTokens: 0,
+            totalTokens: 0,
+            contextTokens: 0,
+            costUsd: 0,
+          }
+        }
+        managed.tokenUsage.contextUsage = event.contextUsage
+        this.sendEvent({
+          type: 'usage_update',
+          sessionId: managed.id,
+          tokenUsage: {
+            inputTokens: managed.tokenUsage.inputTokens,
+            contextWindow: managed.tokenUsage.contextWindow,
+            contextUsage: event.contextUsage,
+          },
+        }, workspaceId)
+        this.persistSession(managed)
+        break
+      }
+
+      case 'compaction_failed':
+        delete managed.pendingPlanExecution
+        await clearStoredPendingPlanExecution(managed.workspace.rootPath, sessionId)
+        sessionLog.info(`Session ${sessionId}: compaction failed, cleared pending plan execution`)
+        break
 
       case 'complete':
         // Complete event from CraftAgent - accumulate usage from this turn
@@ -7414,9 +9767,8 @@ export class SessionManager implements ISessionManager {
           // Each API call sends the full conversation history, so we use the latest value
           managed.tokenUsage.inputTokens = event.usage.inputTokens
           // outputTokens and costUsd are accumulated across all turns (total session usage)
-          managed.tokenUsage.outputTokens += event.usage.outputTokens
+          addTurnUsage(managed.tokenUsage, event.usage)
           managed.tokenUsage.totalTokens = managed.tokenUsage.inputTokens + managed.tokenUsage.outputTokens
-          managed.tokenUsage.costUsd += event.usage.costUsd ?? 0
           // Cache tokens reflect current state, not accumulated
           managed.tokenUsage.cacheReadTokens = event.usage.cacheReadTokens ?? 0
           managed.tokenUsage.cacheCreationTokens = event.usage.cacheCreationTokens ?? 0
@@ -7453,17 +9805,14 @@ export class SessionManager implements ISessionManager {
             tokenUsage: {
               inputTokens: event.usage.inputTokens,
               contextWindow: event.usage.contextWindow,
+              contextUsage: managed.tokenUsage.contextUsage,
             },
           }, workspaceId)
         }
         break
 
       case 'steer_undelivered':
-        // Steer message was not delivered (no PreToolUse fired before turn ended).
-        // Re-queue it so it's sent as a normal message on the next turn.
-        sessionLog.info(`Steer message undelivered, re-queuing for session ${sessionId}`)
-        managed.messageQueue.push({ message: event.message })
-        managed.wasInterrupted = true
+        this.recoverUndeliveredSteer(managed, event)
         break
 
       // Note: working_directory_changed is user-initiated only (via updateWorkingDirectory),
@@ -7471,7 +9820,23 @@ export class SessionManager implements ISessionManager {
     }
   }
 
+  private readonly turnCompleteListeners = new Set<(sessionId: string) => void>()
+
+  onTurnComplete(listener: (sessionId: string) => void): () => void {
+    this.turnCompleteListeners.add(listener)
+    return () => this.turnCompleteListeners.delete(listener)
+  }
+
   private sendEvent(event: SessionEvent, workspaceId?: string): void {
+    if (event.type === 'complete') {
+      for (const listener of this.turnCompleteListeners) {
+        try {
+          listener(event.sessionId)
+        } catch (error) {
+          sessionLog.warn('turn-complete listener failed:', error)
+        }
+      }
+    }
     if (!this.eventSink) {
       sessionLog.warn('Cannot send event - no event sink')
       return
@@ -7508,6 +9873,15 @@ export class SessionManager implements ISessionManager {
       }, DELTA_BATCH_INTERVAL_MS)
       this.deltaFlushTimers.set(sessionId, timer)
     }
+  }
+
+  /** Remove a failed assistant's unsent batch without affecting another stream. */
+  private discardDelta(sessionId: string, turnId: string): void {
+    if (this.pendingDeltas.get(sessionId)?.turnId !== turnId) return
+    const timer = this.deltaFlushTimers.get(sessionId)
+    if (timer) clearTimeout(timer)
+    this.deltaFlushTimers.delete(sessionId)
+    this.pendingDeltas.delete(sessionId)
   }
 
   /**
@@ -7557,7 +9931,11 @@ export class SessionManager implements ISessionManager {
       model,
       thinkingLevel,
       automationName,
+      automationId,
+      triggerEvent,
+      chainDepth,
       telegramTopic,
+      waitForCompletion,
     } = input
 
     // Warn if llmConnection was specified but doesn't resolve
@@ -7595,14 +9973,12 @@ export class SessionManager implements ISessionManager {
     // and the session is identifiable as automation-initiated after reload
     const managed = this.sessions.get(session.id)
     if (managed) {
-      managed.triggeredBy = { automationName, timestamp: Date.now() }
+      managed.triggeredBy = { automationName, automationId, event: triggerEvent, depth: chainDepth ?? 1, timestamp: Date.now() }
       this.persistSession(managed)
     }
 
-    // Notify renderer to hydrate full session metadata (including title)
-    // before streaming events arrive. Without this, the renderer may create
-    // a synthetic empty session and temporarily show "New chat".
-    this.sendEvent({ type: 'session_created', sessionId: session.id }, workspaceId)
+    // (session_created is emitted by createSession above; triggeredBy is set synchronously
+    // before the renderer's hydrate round-trip resolves, so it is observed.)
 
     // Bind the new session to its Telegram forum topic if the matcher
     // declared `telegramTopic`. Done before `sendMessage` so the first
@@ -7624,7 +10000,24 @@ export class SessionManager implements ISessionManager {
       }
     }
 
-    // Send the prompt
+    // Send the prompt.
+    // Test runs pass `waitForCompletion: false` so we return as soon as the
+    // session exists and the prompt is dispatched — otherwise the RPC blocks
+    // until the entire turn (including tool calls) finishes and trips the 30s
+    // client timeout (craft-agents-oss#943). The session streams live either
+    // way; a background failure surfaces in the session UI and is logged here.
+    if (waitForCompletion === false) {
+      void this.sendMessage(session.id, prompt, undefined, undefined, {
+        skillSlugs: resolved?.skillSlugs,
+      }).catch((err) => {
+        sessionLog.error('[Automations] background sendMessage failed for test run', {
+          sessionId: session.id,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      })
+      return { sessionId: session.id }
+    }
+
     await this.sendMessage(session.id, prompt, undefined, undefined, {
       skillSlugs: resolved?.skillSlugs,
     })
@@ -7658,7 +10051,11 @@ export class SessionManager implements ISessionManager {
   // Export / Import / Dispatch
   // ============================================
 
-  private async generateRemoteTransferSummary(managed: ManagedSession): Promise<string | null> {
+  /**
+   * Summarize a session's conversation for a handoff into a fresh session: remote transfer and
+   * "continue in a new session" (coding mode switch). Null when there is nothing to summarize.
+   */
+  private async generateSessionHandoffSummary(managed: ManagedSession): Promise<string | null> {
     await this.ensureMessagesLoaded(managed)
 
     const messages = managed.messages
@@ -7671,6 +10068,23 @@ export class SessionManager implements ISessionManager {
 
     if (messages.length === 0) return null
 
+    const agent = this.createHandoffSummaryAgent(managed)
+    try {
+      // On the session's own connection or not at all: without postInit the CLI started from
+      // process.env, which holds another session's credentials, or none (the user's own login).
+      const { authInjected, authWarning } = await agent.postInit()
+      if (!authInjected) {
+        sessionLog.warn(`[handoff] No summary for ${managed.id}: ${authWarning ?? 'no credentials'}`)
+        return null
+      }
+      return await generateConversationSummary(messages, agent.runMiniCompletion.bind(agent))
+    } finally {
+      agent.destroy()
+    }
+  }
+
+  /** The one-shot agent that writes a handoff summary: the session's connection, its mini model. */
+  private createHandoffSummaryAgent(managed: ManagedSession): AgentInstance {
     const workspaceRootPath = managed.workspace.rootPath
     const wsConfig = loadWorkspaceConfig(workspaceRootPath)
     const defaultModel = wsConfig?.defaults?.model
@@ -7689,7 +10103,7 @@ export class SessionManager implements ISessionManager {
       ...(miniModel ? { ANTHROPIC_DEFAULT_HAIKU_MODEL: miniModel } : {}),
     }
 
-    const agent = createBackendFromResolvedContext({
+    return createBackendFromResolvedContext({
       context: backendContext,
       hostRuntime: buildBackendHostRuntimeContext(),
       coreConfig: {
@@ -7712,12 +10126,6 @@ export class SessionManager implements ISessionManager {
       },
       providerOptions: { piAuthProvider: backendContext.connection?.piAuthProvider },
     })
-
-    try {
-      return await generateConversationSummary(messages, agent.runMiniCompletion.bind(agent))
-    } finally {
-      agent.destroy()
-    }
   }
 
   async exportRemoteSessionTransfer(sessionId: string, workspaceId: string): Promise<RemoteSessionTransferPayload | null> {
@@ -7740,7 +10148,7 @@ export class SessionManager implements ISessionManager {
     this.persistSession(managed)
     await sessionPersistenceQueue.flush(sessionId)
 
-    const summary = await this.generateRemoteTransferSummary(managed)
+    const summary = await this.generateSessionHandoffSummary(managed)
     if (!summary) {
       sessionLog.warn(`[dispatch] Failed to generate remote transfer summary for ${sessionId}`)
       return null
@@ -7886,13 +10294,15 @@ export class SessionManager implements ISessionManager {
       permissionMode: header.permissionMode,
       previousPermissionMode: header.previousPermissionMode,
       sessionStatus: header.sessionStatus,
-      labels: header.labels,
+      labels: this.canonicalLabels(workspaceRootPath, header.labels),
       enabledSourceSlugs: header.enabledSourceSlugs,
       workingDirectory: header.workingDirectory,
       model: header.model,
       llmConnection: header.llmConnection,
       connectionLocked: header.connectionLocked,
       thinkingLevel: header.thinkingLevel,
+      // Keeps the SDK session (and its pinned prompt/tool profile) when not forked, so the mode travels with it
+      codingMode: header.codingMode,
       hidden: header.hidden,
       transferredSessionSummary: header.transferredSessionSummary,
       transferredSessionSummaryApplied: header.transferredSessionSummaryApplied,
@@ -8007,8 +10417,8 @@ export class SessionManager implements ISessionManager {
       })
     }
 
-    // Emit session_created so renderer picks it up
-    this.sendEvent({ type: 'session_created', sessionId }, workspaceId)
+    // Built by hand (not via createSession), so announce it explicitly.
+    this.notifySessionCreated(workspaceId, sessionId)
 
     sessionLog.info(`[import] Complete: sessionId=${sessionId}, transferredSummary=${managed.transferredSessionSummary ? `${managed.transferredSessionSummary.length} chars` : 'none'}, applied=${managed.transferredSessionSummaryApplied}, warnings=${warnings.length > 0 ? warnings.join('; ') : 'none'}`)
     return { sessionId, warnings: warnings.length > 0 ? warnings : undefined }

@@ -24,6 +24,8 @@ import {
   type MicrosoftService,
 } from './types.ts';
 import { buildAuthorizationHeader } from './api-tools.ts';
+import type { ApiCredential } from '@craft-agent/session-tools-core/api-auth';
+import { isMultiHeaderCredential, parseStoredApiCredential } from '@craft-agent/session-tools-core/api-auth';
 import type { CredentialId, StoredCredential } from '../credentials/types.ts';
 import { getCredentialManager } from '../credentials/index.ts';
 import { CraftOAuth, getMcpBaseUrl, prepareMcpOAuth, exchangeMcpOAuth, type OAuthCallbacks, type OAuthTokens } from '../auth/oauth.ts';
@@ -44,8 +46,7 @@ import {
   exchangeSlackOAuth,
   refreshSlackToken,
   type SlackOAuthResult,
-  type SlackOAuthOptions,
-} from '../auth/slack-oauth.ts';
+  type SlackOAuthOptions, slackLegacyRelayPortForReturnTo } from '../auth/slack-oauth.ts';
 import {
   startMicrosoftOAuth,
   prepareMicrosoftOAuth,
@@ -73,32 +74,21 @@ export interface AuthResult {
 }
 
 /**
- * API credential types (string for simple auth, object for basic auth or multi-header)
+ * API credential types (string for simple auth, object for basic auth or multi-header).
+ *
+ * Defined in @craft-agent/session-tools-core/api-auth so the source_test
+ * validator and this runtime share one parser and one header builder (OSS #1067).
  */
-export interface BasicAuthCredential {
-  username: string;
-  password: string;
-}
-
-/**
- * Multi-header credentials stored as Record<string, string>
- * Used for APIs like Datadog that require multiple auth headers (DD-API-KEY + DD-APPLICATION-KEY)
- */
-export type MultiHeaderCredential = Record<string, string>;
-
-export type ApiCredential = string | BasicAuthCredential | MultiHeaderCredential;
-
-/**
- * Type guard to check if credential is a MultiHeaderCredential.
- * Returns true for Record<string, string> objects that are NOT BasicAuthCredential.
- */
-export function isMultiHeaderCredential(cred: ApiCredential): cred is MultiHeaderCredential {
-  return (
-    typeof cred === 'object' &&
-    cred !== null &&
-    !('username' in cred && 'password' in cred)
-  );
-}
+export type {
+  ApiCredential,
+  BasicAuthCredential,
+  MultiHeaderCredential,
+} from '@craft-agent/session-tools-core/api-auth';
+export {
+  isMultiHeaderCredential,
+  parseStoredApiCredential,
+  serializeHeaderCredential,
+} from '@craft-agent/session-tools-core/api-auth';
 
 /**
  * SourceCredentialManager - unified credential operations for sources
@@ -247,47 +237,29 @@ export class SourceCredentialManager {
   }
 
   /**
-   * Get API credential for a source (handles basic auth and multi-header JSON parsing)
+   * Get API credential for a source, parsed into the shape the request path
+   * expects: basic auth object, header map, or bare string. Parsing lives in
+   * @craft-agent/session-tools-core/api-auth and is shared with source_test.
    */
   async getApiCredential(source: LoadedSource): Promise<ApiCredential | null> {
     const cred = await this.load(source);
-    // Check both API and MCP headerNames (same credential store pattern)
-    const headerNames = source.config.api?.headerNames || source.config.mcp?.headerNames;
-    debug(`[SourceCredentialManager] getApiCredential for ${source.config.slug}: cred.value exists=${!!cred?.value}, headerNames=${JSON.stringify(headerNames)}`);
     if (!cred?.value) return null;
 
-    // Check for multi-header auth (JSON with header names as keys)
-    // Works for both API sources (api.headerNames) and MCP sources (mcp.headerNames)
-    if (headerNames?.length) {
-      debug(`[SourceCredentialManager] Attempting multi-header parse for ${source.config.slug}, raw value length=${cred.value.length}`);
-      try {
-        const parsed = JSON.parse(cred.value);
-        debug(`[SourceCredentialManager] Parsed JSON keys: ${Object.keys(parsed).join(', ')}`);
-        // Validate all required headers are present
-        const hasAllHeaders = headerNames.every((h) => h in parsed);
-        debug(`[SourceCredentialManager] hasAllHeaders=${hasAllHeaders}`);
-        if (hasAllHeaders) {
-          return parsed as MultiHeaderCredential;
-        }
-      } catch (e) {
-        // Not JSON, fall through to other auth types
-        debug(`[SourceCredentialManager] JSON parse failed: ${e}`);
-      }
-    }
-
-    // Check for basic auth (JSON with username/password)
-    if (source.config.api?.authType === 'basic') {
-      try {
-        const parsed = JSON.parse(cred.value);
-        if (parsed.username && parsed.password) {
-          return parsed as BasicAuthCredential;
-        }
-      } catch {
-        // Not JSON, treat as regular credential
-      }
-    }
-
-    return cred.value;
+    const api = source.config.api;
+    // MCP sources with header credentials use the same JSON header-map storage
+    const headerNames = api?.headerNames || source.config.mcp?.headerNames;
+    const credential = parseStoredApiCredential(cred.value, {
+      authType: api?.authType,
+      headerName: api?.headerName,
+      headerNames,
+    });
+    const shape = typeof credential === 'string'
+      ? 'string'
+      : isMultiHeaderCredential(credential)
+        ? `header map (${Object.keys(credential).length} headers)`
+        : 'basic auth';
+    debug(`[SourceCredentialManager] getApiCredential for ${source.config.slug}: ${shape}`);
+    return credential;
   }
 
   // ============================================================
@@ -416,7 +388,10 @@ export class SourceCredentialManager {
     options: { callbackPort?: number; callbackUrl?: string },
   ): Promise<PreparedOAuthFlow> {
     const { callbackPort } = options;
-    const relayReturnTo = options.callbackUrl;
+    // MCP servers that only accept loopback redirect URIs can opt out of the
+    // relay (`mcp.oauthRelay: false`); the callback URL is then used directly.
+    const directCallbackUrl = source.config.mcp?.oauthRelay === false ? options.callbackUrl : undefined;
+    const relayReturnTo = directCallbackUrl ? undefined : options.callbackUrl;
     // When callbackUrl is provided (WebUI), keep the provider-facing redirect_uri
     // stable so providers like Google only need a single registered callback.
     // The relay unwraps the real server callback target from the outer state.
@@ -471,6 +446,16 @@ export class SourceCredentialManager {
           service = inferSlackServiceFromUrl(api?.baseUrl) || 'full';
         }
 
+        // The Slack app only has the legacy relay registered as a redirect URI
+        // (OSS #1068). Desktop flows hand us a localhost return target, which that
+        // relay serves directly (it redirects to http://localhost:<port>/callback),
+        // so use it and skip the generic relay envelope. WebUI (HTTPS) targets
+        // still need the generic relay, which requires
+        // https://thecraftagents.com/auth/callback to be registered in the Slack app.
+        const legacyRelayPort = slackLegacyRelayPortForReturnTo(relayReturnTo);
+        if (legacyRelayPort !== undefined) {
+          return prepareSlackOAuth({ service, userScopes, callbackPort: legacyRelayPort });
+        }
         prepared = prepareSlackOAuth({ service, userScopes, callbackPort, callbackUrl: providerCallbackUrl });
         break;
       }
@@ -521,7 +506,7 @@ export class SourceCredentialManager {
         if (!source.config.mcp?.url) {
           throw new Error('MCP URL not configured');
         }
-        prepared = await prepareMcpOAuth(source.config.mcp.url, { callbackPort, callbackUrl: providerCallbackUrl });
+        prepared = await prepareMcpOAuth(source.config.mcp.url, { callbackPort, callbackUrl: providerCallbackUrl ?? directCallbackUrl, scopes: source.config.mcp.scopes });
         break;
       }
     }
@@ -649,7 +634,7 @@ export class SourceCredentialManager {
 
     try {
       const oauth = new CraftOAuth(
-        { mcpUrl: source.config.mcp.url },
+        { mcpUrl: source.config.mcp.url, scopes: source.config.mcp.scopes },
         callbacks,
         sessionContext
       );
@@ -899,9 +884,12 @@ export class SourceCredentialManager {
    * This is important because:
    * - Multiple API calls may hit refresh simultaneously when token is expiring
    * - Microsoft rotates refresh tokens, so concurrent refreshes could cause token invalidation
+   *
+   * Keyed like the stored credential (workspace + slug): two workspaces can each have a
+   * source with the same slug, and must never share a refresh or get each other's token.
    */
   async refresh(source: LoadedSource): Promise<string | null> {
-    const key = source.config.slug;
+    const key = `${source.workspaceId}::${source.config.slug}`;
 
     // Return existing refresh promise if one is in progress
     const pending = this.pendingRefreshes.get(key);
@@ -1193,6 +1181,7 @@ export class SourceCredentialManager {
         oauthConfig.tokenUrl,
         cred.clientId || oauthConfig.clientId,
         cred.clientSecret || oauthConfig.clientSecret,
+        oauthConfig.resource,
       );
 
       await this.save(source, {

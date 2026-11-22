@@ -29,6 +29,8 @@ export interface SessionMeta {
   lastReadMessageId?: string
   workingDirectory?: string
   enabledSourceSlugs?: string[]
+  /** Coding mode: lean coding prompt and session tools (shown as a glyph in the session list) */
+  codingMode?: boolean
   /** Shared viewer URL (if shared via viewer) */
   sharedUrl?: string
   /** Shared session ID in viewer (for revoke) */
@@ -43,7 +45,7 @@ export interface SessionMeta {
   hasUnread?: boolean
   /** Labels for filtering (additive tags, many-per-session) */
   labels?: string[]
-  /** Permission mode ('safe', 'ask', 'allow-all') — used by view expressions */
+  /** Permission mode ('safe', 'ask', 'guarded', 'allow-all') — used by view expressions */
   permissionMode?: string
   /** Session status for filtering */
   sessionStatus?: string
@@ -75,6 +77,24 @@ export interface SessionMeta {
   isArchived?: boolean
   /** Timestamp when session was archived (for retention policy) */
   archivedAt?: number
+  /** Workspace-scoped project id this session is bound to (undefined = unbound) */
+  projectId?: string
+  /** Parent session id — when set, this session is a subtask of the parent (undefined = top-level task) */
+  parentSessionId?: string
+  /** Id of the session this one was branched from (undefined = not a branch) */
+  branchFromSessionId?: string
+  /** Kanban board column id ('todo' | 'in-progress' | 'done'); independent of sessionStatus */
+  kanbanColumn?: string
+  /** Tasks Conductor: slug of the task spec this session belongs to (orchestrator + child nodes) */
+  taskSlug?: string
+  /** Tasks Conductor: id of the run that spawned this child session (Conductor-owned children only) */
+  taskRunId?: string
+  /** Tasks Conductor: id of the DAG node this child session executes (Conductor-owned children only) */
+  taskNodeId?: string
+  /** Tasks Conductor: total DAG node count (orchestrator only) — stable board progress denominator while children spawn lazily */
+  taskNodeCount?: number
+  /** Tasks Conductor: a generate-time draft orchestrator, hidden from the board until adopted by createTask. */
+  taskDraft?: boolean
 }
 
 /**
@@ -109,7 +129,11 @@ export function extractSessionMeta(session: Session): SessionMeta {
   return {
     ...sessionFields,
     lastFinalMessageId: sessionLastFinal ?? findLastFinalMessageId(messages),
-    messageCount: messageCount ?? messages.length ?? 0,
+    // Math.max, not ??: streaming appends grow `messages` without touching the
+    // session's `messageCount` field, so a defined-but-stale count (stamped at
+    // load/creation) must never shadow the live length. Meta-only sessions
+    // (empty `messages`) keep the server/header count.
+    messageCount: Math.max(messageCount ?? 0, messages.length),
     isAsyncOperationOngoing: isAsyncOperationOngoing ?? isRegeneratingTitle,
     isRegeneratingTitle,
   } as SessionMeta
@@ -676,19 +700,49 @@ export const forceSessionMessagesReloadAtom = atom(
 /**
  * Background task for ActiveTasksBar display
  */
+/**
+ * Lifecycle status of a background task chip.
+ * - `running`  — backgrounded, no terminal signal yet (chip shows a spinner + live elapsed).
+ * - `stale` — no lifecycle signal arrived within the renderer timeout. The task may
+ *   still be running, so the chip shows an unknown state and remains recoverable.
+ * - `completed`/`failed`/`stopped` — a real task_completed notification arrived.
+ * - `orphaned` — the turn that owned the task ended before it finished, so it was
+ *   terminated with that turn's subprocess. Shown distinctly instead of a false
+ *   "running". Not produced once WS2 keep-alive is enabled.
+ */
+export type BackgroundTaskStatus = 'running' | 'stale' | 'completed' | 'failed' | 'stopped' | 'orphaned'
+
 export interface BackgroundTask {
   /** Task or shell ID */
   id: string
-  /** Task type */
-  type: 'agent' | 'shell'
+  /** Task type. 'workflow' = a fan-out Workflow launch (many sub-agents). */
+  type: 'agent' | 'shell' | 'workflow'
   /** Tool use ID for correlation with messages */
   toolUseId: string
+  /** Workflow run id (wf_...) — set for type 'workflow'; correlates agent-completed updates. */
+  workflowId?: string
+  /** Count of sub-agents that have completed so far (type 'workflow' only). */
+  agentsCompleted?: number
   /** When the task started */
   startTime: number
-  /** Elapsed seconds (from progress events) */
+  /** Elapsed seconds (from progress events; the chip also derives it from startTime) */
   elapsedSeconds: number
+  /** Last renderer-observed lifecycle/progress signal; falls back to startTime. */
+  lastSignalAt?: number
   /** Task intent/description */
   intent?: string
+  /** Lifecycle status; defaults to 'running' when added */
+  status: BackgroundTaskStatus
+  /** ms timestamp when the task reached a terminal/orphaned status */
+  completedAt?: number
+  /** Output file for click-through, set when task_completed arrives */
+  outputFile?: string
+  /** Short summary, set when task_completed arrives */
+  summary?: string
+  /** What a running task is doing (task_activity): the agent's one-line summary, its last tool, its step count */
+  activity?: { summary?: string; lastToolName?: string; toolUses?: number }
+  /** A stop was requested; the stopped status arrives as task_completed */
+  stopping?: boolean
 }
 
 /**

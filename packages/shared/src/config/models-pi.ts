@@ -1,7 +1,7 @@
 /**
  * Pi Model & Provider Discovery (from SDK)
  *
- * Separated from models.ts because @mariozechner/pi-ai transitively pulls in
+ * Separated from models.ts because @earendil-works/pi-ai transitively pulls in
  * @aws-sdk/client-bedrock-runtime → @smithy/node-http-handler → Node.js `stream`,
  * which breaks the Vite renderer build (browser context, no Node.js modules).
  *
@@ -13,9 +13,10 @@
  * NEVER import this file from renderer components or from files that the renderer imports.
  */
 
-import { getProviders, getModels } from '@mariozechner/pi-ai';
-import type { KnownProvider, Model, Api } from '@mariozechner/pi-ai';
+import { getProviders, getModels } from '@earendil-works/pi-ai/compat';
+import type { Model, Api } from '@earendil-works/pi-ai';
 import type { ModelDefinition } from './models.ts';
+import { fromPiProviderId, toPiProviderId } from './pi-provider-ids.ts';
 
 // ============================================
 // PI MODEL DISCOVERY
@@ -74,7 +75,7 @@ function isExcludedPiModel(modelId: string): boolean {
 
 /**
  * Check if a Bedrock model ID is a bare Claude model without a region prefix.
- * Bare IDs like `anthropic.claude-opus-4-7-v1` are rejected by Bedrock which
+ * Bare IDs like `anthropic.claude-opus-4-8` are rejected by Bedrock which
  * requires inference profile IDs with a region prefix (`us.`, `eu.`, `global.`).
  * The Pi SDK catalog includes proper regional variants, so filtering bare models
  * doesn't remove any usable entries.
@@ -88,7 +89,7 @@ function isBareBedrockClaudeModel(modelId: string): boolean {
  */
 export function getPiModelsForAuthProvider(piAuthProvider: string): ModelDefinition[] {
   try {
-    const models = getModels(piAuthProvider as KnownProvider);
+    const models = getModels(toPiProviderId(piAuthProvider) as Parameters<typeof getModels>[0]);
     if (models.length > 0) {
       return models
         .filter(m => !isExcludedPiModel(m.id))
@@ -147,9 +148,12 @@ const PI_PROVIDER_DISPLAY: Partial<Record<string, { label: string; placeholder: 
   'amazon-bedrock':         { label: 'Amazon Bedrock',     placeholder: 'AKIA...' },
   'azure-openai-responses': { label: 'Azure OpenAI',       placeholder: 'Paste your key here...' },
   'vercel-ai-gateway':      { label: 'Vercel AI Gateway',  placeholder: 'Paste your key here...' },
+  'cloudflare-ai-gateway':  { label: 'Cloudflare AI Gateway', placeholder: 'Cloudflare API token' },
   'huggingface':            { label: 'Hugging Face',       placeholder: 'hf_...' },
   'minimax':                { label: 'Minimax',            placeholder: 'Paste your key here...' },
   'kimi-coding':            { label: 'Kimi (Coding)',      placeholder: 'sk-kimi-...' },
+  'moonshotai':             { label: 'Moonshot AI',        placeholder: 'sk-...' },
+  'moonshotai-cn':          { label: 'Moonshot AI (CN)',   placeholder: 'sk-...' },
   'zai':                    { label: 'z.ai (GLM)',         placeholder: 'Paste your key here...' },
 };
 
@@ -179,6 +183,7 @@ function formatProviderName(key: string): string {
  */
 export function getPiApiKeyProviders(): PiProviderInfo[] {
   return getProviders()
+    .map(fromPiProviderId)
     .filter(p => !PI_EXCLUDED_PROVIDERS.has(p))
     .map(p => {
       const display = PI_PROVIDER_DISPLAY[p];
@@ -204,7 +209,7 @@ export function getPiApiKeyProviders(): PiProviderInfo[] {
  */
 export function getPiProviderBaseUrl(provider: string): string | undefined {
   try {
-    const models = getModels(provider as Parameters<typeof getModels>[0]);
+    const models = getModels(toPiProviderId(provider) as Parameters<typeof getModels>[0]);
     return models[0]?.baseUrl || undefined;
   } catch {
     return undefined;

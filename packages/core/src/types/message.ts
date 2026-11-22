@@ -2,6 +2,8 @@
  * Message types for conversations
  */
 
+import type { ContextUsageSnapshot } from './context-usage.ts';
+
 /**
  * Message roles for display (runtime)
  */
@@ -287,10 +289,16 @@ export interface Message {
   isQueued?: boolean;
   // Intermediate text (commentary between tool calls, not final response)
   isIntermediate?: boolean;
+  // Hidden: a system-generated message that must reach the model (it drives a
+  // turn) but must NOT render as a bubble in the transcript — e.g. the WS2
+  // background-task-completion nudge that wakes an idle session to present a
+  // finished background agent's result. Filtered out in groupMessagesByTurn so
+  // it never appears as a user/assistant bubble (desktop + viewer).
+  hidden?: boolean;
   // Turn ID: Correlation ID from the API's message.id, groups all messages in an assistant turn
   turnId?: string;
-  // Status type for special status messages (e.g., compacting)
-  statusType?: 'compacting' | 'compaction_complete';
+  // Status type for special status messages (retrying is transient renderer state)
+  statusType?: 'compacting' | 'compaction_complete' | 'retrying';
   // Info level for info messages (determines icon/color)
   infoLevel?: 'info' | 'warning' | 'error' | 'success';
   // Error-specific fields (for typed errors with diagnostics)
@@ -368,8 +376,8 @@ export interface StoredMessage {
   // Turn grouping - critical for TurnCard rendering after reload
   isIntermediate?: boolean;
   turnId?: string;
-  // Status type for compaction messages (persisted for reload)
-  statusType?: 'compacting' | 'compaction_complete';
+  // Status type (retry progress is not persisted by the session manager)
+  statusType?: 'compacting' | 'compaction_complete' | 'retrying';
   // Info level for info messages (persisted for reload)
   infoLevel?: 'info' | 'warning' | 'error' | 'success';
   // Error display fields
@@ -423,6 +431,9 @@ export interface TokenUsage {
   costUsd: number;
   cacheReadTokens?: number;
   cacheCreationTokens?: number;
+  contextWindow?: number;
+  /** Current occupancy, separate from cumulative/billable counters. */
+  contextUsage?: ContextUsageSnapshot;
 }
 
 /**
@@ -464,6 +475,7 @@ export type ErrorCode =
   | 'invalid_model'          // Model ID not found
   | 'data_policy_error'      // OpenRouter data policy restriction
   | 'invalid_request'        // API rejected the request (e.g., bad image, invalid content)
+  | 'model_refusal'          // The model's safeguards stopped its reply, and no other model answered
   | 'image_too_large'        // Image exceeds API dimension/size limits
   | 'provider_error'         // AI provider experiencing issues (overloaded, unavailable)
   | 'queued_message_replay_failed'  // A message queued during an active turn could not be auto-replayed (#616)
@@ -499,6 +511,13 @@ export interface TypedError {
 export type PermissionRequestType = 'bash' | 'file_write' | 'mcp_mutation' | 'api_mutation' | 'admin_approval';
 
 /**
+ * What a permission prompt's action does, as judged by the decision model
+ * (opt-in, `riskBadges`). Informational badges only: they never change the
+ * prompt or its outcome.
+ */
+export type PermissionRisk = 'deletes' | 'sends' | 'publishes' | 'credentials' | 'system' | 'spends';
+
+/**
  * Permission request from agent (e.g., bash command approval)
  */
 export interface PermissionRequest {
@@ -521,6 +540,10 @@ export interface PermissionRequest {
   commandHash?: string;
   /** Approval validity window */
   approvalTtlSeconds?: number;
+  /** Decision-model risk badges (opt-in); absent when the feature is off or unsure */
+  risks?: PermissionRisk[];
+  /** `false` when "Always Allow" would remember nothing (e.g. Guarded-mode prompts): the button is hidden */
+  canRemember?: boolean;
 }
 
 /**
@@ -535,6 +558,13 @@ export interface AgentEventUsage {
   costUsd?: number;
   /** Model's context window size in tokens (from SDK modelUsage) */
   contextWindow?: number;
+  /**
+   * Totals for the backend's whole session so far (Claude SDK `total_cost_usd` and `modelUsage`,
+   * subagents included). They grow across turns and resumes and restart at /clear or a new SDK
+   * session, so consumers add the change since the last totals instead of summing; when present
+   * they replace `costUsd`/`outputTokens` for cumulative accounting.
+   */
+  runningTotals?: { costUsd: number; outputTokens: number };
 }
 
 /**
@@ -542,8 +572,17 @@ export interface AgentEventUsage {
  * turnId: Correlation ID from the API's message.id, groups all events in an assistant turn
  */
 export type AgentEvent =
+  // Failed assistant output is discarded before a retry can produce more text.
+  | { type: 'text_discard'; turnId: string }
+  // The backend took back output it had sent (Claude: a reply its safeguards stopped, which a
+  // fallback model answers instead): remove the assistant text of these turns and these tool calls.
+  | { type: 'messages_retracted'; turnIds: string[]; toolUseIds: string[] }
+  // The model's safeguards stopped a reply. fallbackModel: the session goes on with that model.
+  | { type: 'model_refusal'; message: string; fallbackModel?: string }
+  | { type: 'retry'; phase: 'backoff'; message: string }
+  | { type: 'retry'; phase: 'active' | 'end' }
   | { type: 'status'; message: string }
-  | { type: 'info'; message: string }
+  | { type: 'info'; message: string; compactionTrigger?: 'manual' | 'auto' }
   | { type: 'text_delta'; text: string; turnId?: string; parentToolUseId?: string }
   | { type: 'text_complete'; text: string; isIntermediate?: boolean; turnId?: string; parentToolUseId?: string; sdkMessageId?: string }
   | { type: 'pi_turn_anchor'; sdkMessageId: string; sdkTurnAnchor: string }
@@ -568,18 +607,50 @@ export type AgentEvent =
   | { type: 'typed_error'; error: TypedError }
   | { type: 'complete'; usage?: AgentEventUsage }
   | { type: 'working_directory_changed'; workingDirectory: string }
-  | { type: 'task_backgrounded'; toolUseId: string; taskId: string; intent?: string; turnId?: string }
+  | { type: 'task_backgrounded'; toolUseId: string; taskId: string; intent?: string; turnId?: string; kind?: 'workflow' | 'task'; workflowId?: string }
   | { type: 'shell_backgrounded'; toolUseId: string; shellId: string; intent?: string; command?: string; turnId?: string }
   | { type: 'task_progress'; toolUseId: string; elapsedSeconds: number; turnId?: string }
-  | { type: 'task_completed'; taskId: string; status: 'completed' | 'failed' | 'stopped'; outputFile?: string; summary?: string; turnId?: string }
+  /** What a running background task of the session's own agent is doing (SDK `task_progress`). */
+  | { type: 'task_activity'; taskId: string; toolUseId?: string; /** One-line, model-generated status ("Analyzing the auth module") when the SDK has one */ summary?: string; lastToolName?: string; toolUses?: number; turnId?: string }
+  | { type: 'task_completed'; taskId: string; status: 'completed' | 'failed' | 'stopped'; outputFile?: string; summary?: string; turnId?: string; toolUseId?: string; /** The session's own agent started it (a top-level tool call), not a subagent. */ launchedHere?: boolean }
+  | { type: 'workflow_agent_completed'; workflowId: string; agentId: string; turnId?: string }
   | { type: 'shell_killed'; shellId: string; turnId?: string }
   | { type: 'source_activated'; sourceSlug: string; originalMessage: string }
   | { type: 'usage_update'; usage: Pick<AgentEventUsage, 'inputTokens' | 'contextWindow'> }
-  | { type: 'steer_undelivered'; message: string };
+  | { type: 'context_usage'; contextUsage: ContextUsageSnapshot }
+  | { type: 'compaction_failed' }
+  | { type: 'steer_undelivered'; message: string; messageId?: string };
 
 /**
  * Generate a unique message ID
  */
 export function generateMessageId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * The messages without what a `messages_retracted` event took back: the assistant text of its
+ * turns, its tool calls, and everything a subagent one of those calls started posted.
+ */
+export function withoutRetractedMessages<M extends Pick<Message, 'role' | 'turnId' | 'toolUseId' | 'parentToolUseId'>>(
+  messages: M[],
+  retracted: { turnIds: readonly string[]; toolUseIds: readonly string[] },
+): M[] {
+  const turnIds = new Set(retracted.turnIds);
+  const toolUseIds = new Set(retracted.toolUseIds);
+  // A subagent's own calls go with the call that started it, at any depth
+  for (let grew = toolUseIds.size > 0; grew;) {
+    grew = false;
+    for (const message of messages) {
+      if (message.toolUseId && message.parentToolUseId && toolUseIds.has(message.parentToolUseId) && !toolUseIds.has(message.toolUseId)) {
+        toolUseIds.add(message.toolUseId);
+        grew = true;
+      }
+    }
+  }
+  return messages.filter(message => !(
+    (message.role === 'assistant' && message.turnId !== undefined && turnIds.has(message.turnId))
+    || (message.toolUseId !== undefined && toolUseIds.has(message.toolUseId))
+    || (message.parentToolUseId !== undefined && toolUseIds.has(message.parentToolUseId))
+  ));
 }

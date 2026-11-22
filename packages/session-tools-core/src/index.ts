@@ -82,6 +82,28 @@ export {
   getEffectiveHeaderNames,
 } from './source-helpers.ts';
 
+// API credential parsing and request-auth assembly (shared with @craft-agent/shared)
+export {
+  isBasicAuthCredential,
+  isMultiHeaderCredential,
+  parseJsonHeaderMap,
+  apiAuthSpecFromConfig,
+  parseStoredApiCredential,
+  serializeHeaderCredential,
+  buildAuthorizationHeader,
+  buildApiAuthHeaders,
+  appendQueryAuth,
+  describeApiAuth,
+} from './api-auth.ts';
+export type {
+  ApiCredential,
+  BasicAuthCredential,
+  MultiHeaderCredential,
+  ApiAuthKind,
+  ApiAuthSpec,
+  StoredCredentialShape,
+} from './api-auth.ts';
+
 // Validation
 export {
   // Result helpers
@@ -127,11 +149,57 @@ export type {
   ApiTestResult,
   // Session self-management types
   SessionInfo,
+  SessionTaskInfo,
   SessionListItem,
   ListSessionsOptions,
   ListSessionsResult,
+  BackgroundTaskInfo,
+  SendAgentMessageResult,
   ResolvedLabelsResult,
   ResolvedStatusResult,
+  CreateTaskInput,
+  CreateTaskResult,
+  ProjectMemoryAppendInput,
+  ProjectMemoryAppendResult,
+  // Pages types
+  PagesToolCallbacks,
+  PageToolRefreshSpec,
+  PageToolSummary,
+  PageToolDataSummary,
+  PageToolDetails,
+  CreatePageToolInput,
+  UpdatePageToolPatch,
+  PageDataToolPatch,
+  PageDataWriteSummary,
+  DeletePageToolResult,
+  // MCP source resources & prompts types
+  McpSourceToolCallbacks,
+  McpSourceResource,
+  McpSourceResourceTemplate,
+  McpSourceResourceList,
+  McpSourcePrompt,
+  McpSourcePromptArgument,
+  McpSourcePromptList,
+  // Decision tool types
+  DecisionToolCallbacks,
+  DecisionToolQuestionType,
+  DecisionToolInstructions,
+  DecisionToolCriteria,
+  DecisionToolQuestion,
+  DecisionToolState,
+  DecisionToolRequest,
+  DecisionToolAnswer,
+  DecisionToolUsage,
+  DecisionToolError,
+  DecisionToolResult,
+  // PR watcher tool types
+  PrWatchToolCallbacks,
+  PrToolMergeMethod,
+  PrToolStatus,
+  PrToolStatusResult,
+  PrBindToolResult,
+  PrUnbindToolResult,
+  PrAutoMergeToolResult,
 } from './context.ts';
 
 export { createNodeFileSystem } from './context.ts';
@@ -155,6 +223,11 @@ export {
   handleMicrosoftOAuthTrigger,
   // Credential Prompt
   handleCredentialPrompt,
+  // MCP source resources & prompts
+  handleSourceListResources,
+  handleSourceReadResource,
+  handleSourceListPrompts,
+  handleSourceGetPrompt,
   // Update Preferences
   handleUpdatePreferences,
   // Transform Data
@@ -165,6 +238,15 @@ export {
   handleRenderTemplate,
   // Send Developer Feedback
   handleSendDeveloperFeedback,
+  // Pages
+  handleListPages,
+  handleGetPage,
+  handleCreatePage,
+  handleUpdatePage,
+  handleWritePageData,
+  handleDeletePage,
+  // Decision model
+  handleDecide,
 } from './handlers/index.ts';
 
 export type {
@@ -178,11 +260,22 @@ export type {
   SlackOAuthTriggerArgs,
   MicrosoftOAuthTriggerArgs,
   CredentialPromptArgs,
+  SourceListResourcesArgs,
+  SourceReadResourceArgs,
+  SourceListPromptsArgs,
+  SourceGetPromptArgs,
   UpdatePreferencesArgs,
   TransformDataArgs,
   ScriptSandboxArgs,
   RenderTemplateArgs,
   SendDeveloperFeedbackArgs,
+  ListPagesArgs,
+  GetPageArgs,
+  CreatePageArgs,
+  UpdatePageArgs,
+  WritePageDataArgs,
+  DeletePageArgs,
+  DecideArgs,
 } from './handlers/index.ts';
 
 // Tool definitions — single source of truth
@@ -195,7 +288,13 @@ export {
   SourceTestSchema,
   SourceOAuthTriggerSchema,
   CredentialPromptSchema,
+  // MCP source resources & prompts schemas
+  SourceListResourcesSchema,
+  SourceReadResourceSchema,
+  SourceListPromptsSchema,
+  SourceGetPromptSchema,
   CallLlmSchema,
+  DecideSchema,
   UpdatePreferencesSchema,
   TransformDataSchema,
   ScriptSandboxSchema,
@@ -204,6 +303,13 @@ export {
   BrowserToolSchema,
   // Developer feedback schema
   SendDeveloperFeedbackSchema,
+  // Pages schemas
+  ListPagesSchema,
+  GetPageSchema,
+  CreatePageSchema,
+  UpdatePageSchema,
+  WritePageDataSchema,
+  DeletePageSchema,
   // Descriptions
   TOOL_DESCRIPTIONS,
   // Registry
@@ -214,6 +320,8 @@ export {
   SESSION_SAFE_ALLOWED_TOOL_NAMES,
   SESSION_SAFE_BLOCKED_TOOL_NAMES,
   SESSION_TOOL_REGISTRY,
+  CODING_PROFILE_TOOLS,
+  CODING_ONLY_TOOLS,
   // Filtered helper views
   getSessionToolDefs,
   getSessionToolNames,
@@ -236,4 +344,20 @@ export type {
   JsonSchemaToolDef,
   SessionToolFilterOptions,
   SessionToolNameOptions,
+  AgentProfile,
 } from './tool-defs.ts';
+
+// Script runtime resolution + path containment (also used by the shared
+// automations script action — keep these exports runtime-only, no zod)
+export {
+  resolveScriptRuntime,
+} from './runtime/resolve-script-runtime.ts';
+export type {
+  ScriptRuntimeLanguage,
+  ResolvedScriptRuntime,
+  ResolveScriptRuntimeContext,
+} from './runtime/resolve-script-runtime.ts';
+export {
+  isPathWithinDirectory,
+  isPathWithinDirectoryForCreation,
+} from './runtime/path-security.ts';

@@ -14,6 +14,9 @@
  * - PlatformProvider/usePlatform: Inject platform-specific actions
  */
 
+// Motion presets (tokens.css mirror) + Motion setting provider
+export * from './motion'
+
 // Context
 export {
   PlatformProvider,
@@ -86,11 +89,20 @@ export {
   type MarkdownImageBlockProps,
   type ImageCardStackProps,
   type ImageCardStackItem,
+  RunCommandProvider,
+  useRunCommand,
+  type RunCommandHandler,
+  shellCommandFromBlock,
+  consoleSnippetCommand,
+  describeFileLinkClick,
+  type FileLinkClick,
+  type FileOpenHandler,
 } from './components/markdown'
 
 // UI primitives
 export {
   Spinner,
+  LoadingIndicator,
   SimpleDropdown,
   SimpleDropdownItem,
   PreviewHeader,
@@ -113,7 +125,9 @@ export {
   IslandContentView,
   IslandFollowUpContentView,
   useIslandNavigation,
+  AnimatedCollapsibleContent,
   type SpinnerProps,
+  type LoadingIndicatorProps,
   type SimpleDropdownProps,
   type SimpleDropdownItemProps,
   type PreviewHeaderProps,

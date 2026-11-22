@@ -10,6 +10,7 @@ import * as React from 'react'
 import { createContext, useContext, useCallback } from 'react'
 import { useAtomValue } from 'jotai'
 import type { ChatDisplayHandle } from '@/components/app-shell/ChatDisplay'
+import type { FileOpenHandler } from '@craft-agent/ui'
 import type {
   Session,
   Workspace,
@@ -57,12 +58,20 @@ export interface AppShellContextType {
   enabledSources?: LoadedSource[]
   /** All skills for this workspace - provided by AppShell component (for @mentions) */
   skills?: LoadedSkill[]
+  /** User-defined chat starter prompts from workspace config */
+  chatStarters?: Array<{ label: string; prompt: string }>
   /** Working directory of the active session — needed for project-level skill resolution */
   activeSessionWorkingDirectory?: string
   /** All label configs (tree) for label menu and badge display */
   labels?: import('@craft-agent/shared/labels').LabelConfig[]
   /** Callback when session labels change */
   onSessionLabelsChange?: (sessionId: string, labels: string[]) => void
+  /**
+   * Open All Sessions scoped to a task: replaces the view's label filter (and project
+   * filter when given) with the task's scope — the same user-clearable header-chip
+   * filters — and selects the session. Used by kanban tile/subtask clicks + post-create.
+   */
+  onJumpToTaskSessions?: (sessionId: string, scope: { labelId: string; projectId?: string }) => void
   /** Enabled permission modes for Shift+Tab cycling */
   enabledModes?: PermissionMode[]
   /** Dynamic todo states from workspace config (provided by AppShell, defaults to empty) */
@@ -104,7 +113,7 @@ export interface AppShellContextType {
   ) => void
 
   // File/URL handlers - these can open in tabs or external apps
-  onOpenFile: (path: string) => void
+  onOpenFile: FileOpenHandler
   onOpenUrl: (url: string) => void
 
   // Workspace
@@ -141,6 +150,9 @@ export interface AppShellContextType {
   /** Whether this panel is the focused panel (for multi-panel visual differentiation) */
   isFocusedPanel?: boolean
 
+  /** The panel-stack entry this subtree renders in (set by PanelSlot; the same session can be open in two panels) */
+  panelId?: string
+
   /** Whether the shell is currently in compact/narrow mode */
   isCompactMode?: boolean
 
@@ -172,6 +184,9 @@ export interface AppShellContextType {
   /** Replay (re-execute) webhook actions for a failed automation */
   onReplayAutomation?: (automationId: string, event: string) => void
 }
+
+/** Window event (detail: `{ workspaceId }`) asking AppShell to reload that workspace's settings. */
+export const WORKSPACE_SETTINGS_CHANGED_EVENT = 'craft:workspace-settings-changed'
 
 const AppShellContext = createContext<AppShellContextType | null>(null)
 

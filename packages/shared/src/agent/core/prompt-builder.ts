@@ -16,6 +16,10 @@ import { isLocalMcpEnabled } from '../../workspaces/storage.ts';
 import { formatPreferencesForPrompt } from '../../config/preferences.ts';
 import { formatSessionState } from '../mode-manager.ts';
 import { getDateTimeContext, getWorkingDirectoryContext } from '../../prompts/system.ts';
+import {
+  formatStableGitDeveloperContext,
+  formatVolatileGitDeveloperContext,
+} from '../../prompts/developer-context.ts';
 import { getSessionPlansPath, getSessionDataPath, getSessionPath } from '../../sessions/storage.ts';
 import type {
   PromptBuilderConfig,
@@ -45,6 +49,7 @@ export class PromptBuilder {
   private config: PromptBuilderConfig;
   private workspaceRootPath: string;
   private pinnedPreferencesPrompt: string | null = null;
+  private stableDeveloperContextCache: { workingDirectory: string | undefined; value: string | null } | null = null;
 
   constructor(config: PromptBuilderConfig) {
     this.config = config;
@@ -56,8 +61,18 @@ export class PromptBuilder {
   // ============================================================
 
   /**
-   * Build all context parts for a user message.
-   * Returns an array of strings that should be prepended to the user message.
+   * Build all context parts for a user message (volatile blocks first, then
+   * stable blocks). Returns an array of strings that should be prepended to the
+   * user message.
+   *
+   * This is the Claude path: it composes {@link buildVolatileContextParts} and
+   * {@link buildStableContextParts} so the output is byte-identical to the
+   * pre-split behavior while adding git developer context in the correct stable
+   * vs volatile half. The one-shot mode-change signal is consumed exactly once
+   * per turn (only the volatile builder consumes
+   * it). Callers that place volatile vs stable context in different locations
+   * (e.g. the Pi adapter, to preserve prompt caching — issue #862) should call
+   * the two halves directly instead of this method.
    *
    * @param options - Context building options
    * @param sourceStateBlock - Pre-formatted source state (from SourceManager)
@@ -67,12 +82,44 @@ export class PromptBuilder {
     options: ContextBlockOptions,
     sourceStateBlock?: string
   ): string[] {
+    return [
+      ...this.buildVolatileContextParts(options, sourceStateBlock),
+      ...this.buildStableContextParts(),
+    ];
+  }
+
+  /**
+   * Volatile context blocks — content that can change every turn, so it must
+   * ride the user-message tail rather than the cached system prefix (issue
+   * #862). Folding these into the system prompt re-stamps the cache prefix each
+   * turn and kills prompt-cache reuse for all downstream history.
+   *
+   * Blocks (in order):
+   *  1. date/time (minute precision)
+   *  2. session_state (permission mode + plans/data paths; carries
+   *     modeChangedAt/modeVersion and **consumes** the one-shot mode-change user
+   *     signal — see {@link formatSessionState})
+   *  3. source state (auth/connection status), when provided
+   *  4. volatile git developer context, when the selected working directory is in a repo
+   *
+   * MUST be called exactly once per turn, because it consumes one-shot mode
+   * state. Never call it a second time to compute a cache-debug hash — hash the
+   * already-produced string instead.
+   *
+   * @param options - Context building options
+   * @param sourceStateBlock - Pre-formatted source state (from SourceManager)
+   */
+  buildVolatileContextParts(
+    options: ContextBlockOptions,
+    sourceStateBlock?: string
+  ): string[] {
     const parts: string[] = [];
 
-    // Add date/time context first (enables prompt caching)
+    // Date/time first (kept on the user tail to preserve prompt caching)
     parts.push(getDateTimeContext());
 
-    // Add session state (permission mode, plans folder path, data folder path)
+    // Session state (permission mode, plans folder path, data folder path).
+    // Only this volatile builder may consume the one-shot mode-change signal.
     const sessionId = this.config.session?.id ?? `temp-${Date.now()}`;
     const plansFolderPath = options.plansFolderPath ??
       getSessionPlansPath(this.workspaceRootPath, sessionId);
@@ -84,18 +131,48 @@ export class PromptBuilder {
       consumeModeChangeUserSignal: true,
     }));
 
-    // Add source state if provided
+    // Source state if provided
     if (sourceStateBlock) {
       parts.push(sourceStateBlock);
     }
 
-    // Add workspace capabilities
-    parts.push(this.formatWorkspaceCapabilities());
+    const volatileDeveloperContext = this.getVolatileDeveloperContext();
+    if (volatileDeveloperContext) {
+      parts.push(volatileDeveloperContext);
+    }
 
-    // Add working directory context
+    return parts;
+  }
+
+  /**
+   * Stable context blocks — content that is invariant across a session, so it
+   * can safely live in the cached system prefix (issue #862).
+   *
+   * Blocks (in order):
+   *  1. workspace capabilities (not in coding mode: local MCP support is irrelevant to coding)
+   *  2. working directory, when available
+   *  3. stable git developer context, when the selected working directory is in a repo
+   *
+   * Pure and idempotent: holds no one-shot state, so it is safe to call any
+   * number of times per turn.
+   */
+  buildStableContextParts(): string[] {
+    const parts: string[] = [];
+
+    // Workspace capabilities
+    if (this.config.agentProfile !== 'coding') {
+      parts.push(this.formatWorkspaceCapabilities());
+    }
+
+    // Working directory context
     const workingDirContext = this.getWorkingDirectoryContext();
     if (workingDirContext) {
       parts.push(workingDirContext);
+    }
+
+    const stableDeveloperContext = this.getStableDeveloperContext();
+    if (stableDeveloperContext) {
+      parts.push(stableDeveloperContext);
     }
 
     return parts;
@@ -133,6 +210,29 @@ export class PromptBuilder {
       isSessionRoot,
       this.config.session?.sdkCwd
     );
+  }
+
+  private getSelectedWorkingDirectory(): string | undefined {
+    // Developer context is only for an explicitly selected CWD. The default
+    // session folder can contain attachments/plans but should not be treated as
+    // a code repository even if it happens to live under git-controlled storage.
+    return this.config.session?.workingDirectory;
+  }
+
+  getStableDeveloperContext(): string | null {
+    const workingDirectory = this.getSelectedWorkingDirectory();
+    const cached = this.stableDeveloperContextCache;
+    if (cached && cached.workingDirectory === workingDirectory) {
+      return cached.value;
+    }
+
+    const value = formatStableGitDeveloperContext(workingDirectory);
+    this.stableDeveloperContextCache = { workingDirectory, value };
+    return value;
+  }
+
+  getVolatileDeveloperContext(): string | null {
+    return formatVolatileGitDeveloperContext(this.getSelectedWorkingDirectory());
   }
 
   // ============================================================
@@ -201,6 +301,10 @@ Please continue the conversation naturally from where we left off.
     this.pinnedPreferencesPrompt = null;
   }
 
+  clearDeveloperContextCache(): void {
+    this.stableDeveloperContextCache = null;
+  }
+
   // ============================================================
   // Configuration Accessors
   // ============================================================
@@ -211,6 +315,14 @@ Please continue the conversation naturally from where we left off.
   setWorkspace(workspace: PromptBuilderConfig['workspace']): void {
     this.config.workspace = workspace;
     this.workspaceRootPath = workspace?.rootPath ?? '';
+    this.clearDeveloperContextCache();
+  }
+
+  /**
+   * Update the agent profile (coding mode trims the per-message context).
+   */
+  setAgentProfile(profile: NonNullable<PromptBuilderConfig['agentProfile']>): void {
+    this.config.agentProfile = profile;
   }
 
   /**
@@ -218,6 +330,7 @@ Please continue the conversation naturally from where we left off.
    */
   setSession(session: PromptBuilderConfig['session']): void {
     this.config.session = session;
+    this.clearDeveloperContextCache();
   }
 
   /**

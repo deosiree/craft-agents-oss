@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useTheme } from '@/hooks/useTheme'
-import type { ThemeOverrides } from '@config/theme'
 import { useSetAtom, useStore, useAtomValue, useAtom } from 'jotai'
 import type { Session, Workspace, SessionEvent, Message, FileAttachment, StoredAttachment, PermissionRequest, CredentialRequest, CredentialResponse, SetupNeeds, SessionStatus, NewChatActionParams, ContentBadge, LlmConnectionWithStatus, PermissionModeState } from '../shared/types'
 import type { SessionDraft, DraftAttachmentRef } from '@craft-agent/shared/config'
@@ -51,9 +50,16 @@ import {
   extractSessionMeta,
   windowWorkspaceIdAtom,
   type SessionMeta,
+  type BackgroundTask,
 } from '@/atoms/sessions'
 import { sourcesAtom } from '@/atoms/sources'
 import { skillsAtom } from '@/atoms/skills'
+import {
+  showBackgroundFinishedChipAtom,
+  pushBackgroundFinishedAtom,
+} from '@/atoms/background-finished'
+import { visibleSessionIdsAtom } from '@/atoms/panel-stack'
+import { getSessionTitle } from '@/utils/session'
 import { extractBadges } from '@/lib/mentions'
 import { getDefaultStore } from 'jotai'
 import {
@@ -69,7 +75,12 @@ import { useLinkInterceptor, type FilePreviewState } from '@/hooks/useLinkInterc
 import { useTransportConnectionState } from '@/hooks/useTransportConnectionState'
 import { useStaleSessionRecovery } from '@/hooks/useStaleSessionRecovery'
 import { TransportConnectionBanner, shouldShowTransportConnectionBanner } from '@/components/app-shell/TransportConnectionBanner'
-import { getFileManagerName } from '@/lib/platform'
+import { FileLinkActionMenu } from '@/components/app-shell/FileLinkActionMenu'
+import {
+  markBackgroundTaskSignal,
+  markLiveBackgroundTasksOrphaned,
+} from '@/components/app-shell/background-task-chip-state'
+import { getFileManagerName, isWebUI } from '@/lib/platform'
 import { rendererLog } from '@/lib/logger'
 import { ActionRegistryProvider } from '@/actions'
 import { toast } from 'sonner'
@@ -124,70 +135,141 @@ function handleBackgroundTaskEvent(
     const currentTasks = store.get(backgroundTasksAtom)
     const exists = currentTasks.some(t => t.toolUseId === evt.toolUseId)
     if (!exists) {
+      const isWorkflow = evt.kind === 'workflow'
+      const startTime = Date.now()
       store.set(backgroundTasksAtom, [
         ...currentTasks,
         {
           id: evt.taskId as string,
-          type: 'agent' as const,
+          type: isWorkflow ? ('workflow' as const) : ('agent' as const),
           toolUseId: evt.toolUseId as string,
-          startTime: Date.now(),
+          startTime,
           elapsedSeconds: 0,
+          lastSignalAt: startTime,
           intent: evt.intent as string | undefined,
+          status: 'running' as const,
+          ...(isWorkflow ? { workflowId: evt.workflowId as string | undefined, agentsCompleted: 0 } : {}),
         },
       ])
     }
+  } else if (event.type === 'workflow_agent_completed' && 'workflowId' in evt) {
+    // One sub-agent of a running Workflow finished — bump the owning chip's count
+    // and treat it as evidence that a stale workflow is still alive.
+    const currentTasks = store.get(backgroundTasksAtom)
+    const now = Date.now()
+    store.set(backgroundTasksAtom, currentTasks.map(t =>
+      t.type === 'workflow' && t.workflowId === evt.workflowId
+        ? { ...markBackgroundTaskSignal(t, now), agentsCompleted: (t.agentsCompleted ?? 0) + 1 }
+        : t
+    ))
   } else if (event.type === 'shell_backgrounded' && 'shellId' in evt && 'toolUseId' in evt) {
     const currentTasks = store.get(backgroundTasksAtom)
     const exists = currentTasks.some(t => t.toolUseId === evt.toolUseId)
     if (!exists) {
+      const startTime = Date.now()
       store.set(backgroundTasksAtom, [
         ...currentTasks,
         {
           id: evt.shellId as string,
           type: 'shell' as const,
           toolUseId: evt.toolUseId as string,
-          startTime: Date.now(),
+          startTime,
           elapsedSeconds: 0,
+          lastSignalAt: startTime,
           intent: evt.intent as string | undefined,
+          status: 'running' as const,
         },
       ])
     }
   } else if (event.type === 'task_progress' && 'toolUseId' in evt && 'elapsedSeconds' in evt) {
     const currentTasks = store.get(backgroundTasksAtom)
+    const now = Date.now()
     store.set(backgroundTasksAtom, currentTasks.map(t =>
       t.toolUseId === evt.toolUseId
-        ? { ...t, elapsedSeconds: evt.elapsedSeconds as number }
+        ? { ...markBackgroundTaskSignal(t, now), elapsedSeconds: evt.elapsedSeconds as number }
         : t
     ))
+  } else if (event.type === 'task_activity' && 'taskId' in evt) {
+    // What a running task is doing: the chip card shows its live line and step count. No write when
+    // no chip matches (the array identity stays, so nothing re-renders).
+    const currentTasks = store.get(backgroundTasksAtom)
+    const now = Date.now()
+    let changed = false
+    const nextTasks = currentTasks.map(t => {
+      if (t.id !== evt.taskId && !(typeof evt.toolUseId === 'string' && t.toolUseId === evt.toolUseId)) return t
+      changed = true
+      return {
+        ...markBackgroundTaskSignal(t, now),
+        activity: {
+          ...t.activity,
+          ...(typeof evt.summary === 'string' ? { summary: evt.summary } : {}),
+          ...(typeof evt.lastToolName === 'string' ? { lastToolName: evt.lastToolName } : {}),
+          ...(typeof evt.toolUses === 'number' ? { toolUses: evt.toolUses } : {}),
+        },
+      }
+    })
+    if (changed) store.set(backgroundTasksAtom, nextTasks)
   } else if (event.type === 'task_completed' && 'taskId' in evt) {
-    // Remove task when background task completes
+    // Transition the chip to a terminal status (keep it visible with a terminal
+    // icon + click-through to output). The ActiveTasksBar auto-expiry ticker
+    // prunes it after a short linger — we no longer remove it instantly, so the
+    // user sees that the task finished rather than the chip just vanishing.
+    const status = (evt.status as BackgroundTask['status']) ?? 'completed'
     const currentTasks = store.get(backgroundTasksAtom)
-    store.set(backgroundTasksAtom, currentTasks.filter(t => t.id !== evt.taskId))
+    store.set(backgroundTasksAtom, currentTasks.map(t =>
+      t.id === evt.taskId
+        ? {
+            ...t,
+            status,
+            stopping: false,
+            completedAt: Date.now(),
+            outputFile: (evt.outputFile as string | undefined) ?? t.outputFile,
+            summary: (evt.summary as string | undefined) ?? t.summary,
+          }
+        : t
+    ))
   } else if (event.type === 'shell_killed' && 'shellId' in evt) {
-    // Remove shell task when KillShell succeeds
+    // Mark shell stopped (lingers briefly, then auto-expires) instead of vanishing.
     const currentTasks = store.get(backgroundTasksAtom)
-    store.set(backgroundTasksAtom, currentTasks.filter(t => t.id !== evt.shellId))
+    store.set(backgroundTasksAtom, currentTasks.map(t =>
+      t.id === evt.shellId
+        ? { ...t, status: 'stopped' as const, stopping: false, completedAt: Date.now() }
+        : t
+    ))
   } else if (event.type === 'tool_result' && 'toolUseId' in evt) {
     // Remove task when it completes - but NOT if this is the initial backgrounding result
     // Background tasks return immediately with agentId/shell_id/backgroundTaskId,
     // we should only remove when the task actually completes
     const result = typeof evt.result === 'string' ? evt.result : JSON.stringify(evt.result)
+    // Older and current CLI wordings of "this task now runs in the background".
     const isBackgroundingResult = result && (
       /agentId:\s*[a-zA-Z0-9_-]+/.test(result) ||
       /shell_id:\s*[a-zA-Z0-9_-]+/.test(result) ||
-      /"backgroundTaskId":\s*"[a-zA-Z0-9_-]+"/.test(result)
+      /"backgroundTaskId":\s*"[a-zA-Z0-9_-]+"/.test(result) ||
+      /running in background with ID:\s*[a-zA-Z0-9_-]+/i.test(result) ||
+      /backgrounded by user with ID:\s*[a-zA-Z0-9_-]+/i.test(result) ||
+      /moved to the background \(ID:\s*[a-zA-Z0-9_-]+\)/i.test(result) ||
+      /"resultType":\s*"task"/.test(result) ||
+      /Monitor started \(task\s+[a-zA-Z0-9_-]+/.test(result)
     )
     if (!isBackgroundingResult) {
       const currentTasks = store.get(backgroundTasksAtom)
       store.set(backgroundTasksAtom, currentTasks.filter(t => t.toolUseId !== evt.toolUseId))
     }
+  } else if (event.type === 'complete' || event.type === 'interrupted' || event.type === 'error') {
+    // Orphan backstop: without keep-alive, turn teardown is authoritative evidence
+    // that both running and uncertain/stale background tasks died with the SDK
+    // subprocess. With keep-alive they may genuinely survive, so preserve them for
+    // a later progress or task_completed signal.
+    if (evt.backgroundTasksAlive === true) {
+      return
+    }
+    const currentTasks = store.get(backgroundTasksAtom)
+    const nextTasks = markLiveBackgroundTasksOrphaned(currentTasks, Date.now())
+    if (nextTasks !== currentTasks) {
+      store.set(backgroundTasksAtom, nextTasks)
+    }
   }
-  // Note: We do NOT clear background tasks on complete/error/interrupted
-  // Background tasks should persist and keep running after the turn ends
-  // They are only removed when:
-  // 1. task_completed event arrives (background task finished)
-  // 2. Their tool_result comes back (foreground task finished)
-  // 3. KillShell succeeds (shell_killed event)
 }
 
 function SessionLoadErrorScreen({
@@ -314,7 +396,6 @@ export default function App() {
   const [sessionOptions, setSessionOptions] = useState<Map<string, SessionOptions>>(new Map())
 
   // Theme state (app-level only)
-  const [appTheme, setAppTheme] = useState<ThemeOverrides | null>(null)
   // Reset confirmation dialog
   const [showResetDialog, setShowResetDialog] = useState(false)
 
@@ -349,10 +430,10 @@ export default function App() {
     setSplashHidden(true)
   }, [])
 
-  // Apply theme via hook (injects CSS variables)
+  // Theme state (ThemeProvider injects CSS variables, incl. ~/.craft-agent/theme.json overrides).
   // shikiTheme is passed to ShikiThemeProvider to ensure correct syntax highlighting
   // theme for dark-only themes in light system mode
-  const { shikiTheme, isDark } = useTheme({ appTheme })
+  const { shikiTheme, isDark } = useTheme()
 
   // Ref for sessionOptions to access current value in event handlers without re-registering
   const sessionOptionsRef = useRef(sessionOptions)
@@ -395,6 +476,7 @@ export default function App() {
         ...current,
         permissionMode: state.permissionMode,
         permissionModeVersion: state.modeVersion,
+        previousPermissionMode: state.previousPermissionMode,
       })
       return next
     })
@@ -425,12 +507,13 @@ export default function App() {
         ...current,
         permissionMode: session.permissionMode ?? defaultSessionOptions.permissionMode,
         thinkingLevel: session.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
+        codingMode: session.codingMode === true,
       }
 
       const hasNonDefaultMode = merged.permissionMode !== defaultSessionOptions.permissionMode
       const hasNonDefaultThinking = merged.thinkingLevel !== DEFAULT_THINKING_LEVEL
 
-      if (!hasNonDefaultMode && !hasNonDefaultThinking && merged.permissionModeVersion == null) {
+      if (!hasNonDefaultMode && !hasNonDefaultThinking && !merged.codingMode && merged.permissionModeVersion == null) {
         next.delete(session.id)
       } else {
         next.set(session.id, merged)
@@ -477,10 +560,11 @@ export default function App() {
       for (const s of loadedSessions) {
         const hasNonDefaultMode = s.permissionMode && s.permissionMode !== 'ask'
         const hasNonDefaultThinking = s.thinkingLevel && s.thinkingLevel !== DEFAULT_THINKING_LEVEL
-        if (hasNonDefaultMode || hasNonDefaultThinking) {
+        if (hasNonDefaultMode || hasNonDefaultThinking || s.codingMode) {
           optionsMap.set(s.id, {
             permissionMode: s.permissionMode ?? 'ask',
             thinkingLevel: s.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
+            codingMode: s.codingMode === true,
           })
         }
       }
@@ -735,19 +819,7 @@ export default function App() {
         sessionDraftsRef.current = new Map(Object.entries(drafts))
       }
     })
-    // Load app-level theme
-    window.electronAPI.getAppTheme().then(setAppTheme)
   }, [appState, loadSessionsFromServer, resolveDefaultConnectionSlug])
-
-  // Subscribe to theme change events (live updates when theme.json changes)
-  useEffect(() => {
-    const cleanupApp = window.electronAPI.onAppThemeChange((theme) => {
-      setAppTheme(theme)
-    })
-    return () => {
-      cleanupApp()
-    }
-  }, [])
 
   // Subscribe to LLM connections change events (live updates when models are fetched)
   useEffect(() => {
@@ -779,7 +851,7 @@ export default function App() {
     // Handoff events signal end of streaming - need to sync back to React state
     // Also includes todo_state_changed so status updates immediately reflect in sidebar
     // async_operation included so shimmer effect on session titles updates in real-time
-    const handoffEventTypes = new Set(['complete', 'error', 'interrupted', 'typed_error', 'session_status_changed', 'session_flagged', 'session_unflagged', 'name_changed', 'labels_changed', 'title_generated', 'async_operation'])
+    const handoffEventTypes = new Set(['complete', 'error', 'interrupted', 'typed_error', 'session_status_changed', 'session_metadata_changed', 'session_flagged', 'session_unflagged', 'name_changed', 'labels_changed', 'project_id_changed', 'title_generated', 'async_operation'])
 
     // Helper to handle side effects (same logic for both paths)
     const handleEffects = (effects: Effect[], sessionId: string, eventType: string) => {
@@ -808,6 +880,7 @@ export default function App() {
             if (typeof effect.modeVersion === 'number' && effect.changedAt && effect.changedBy) {
               applyPermissionModeState(effect.sessionId, {
                 permissionMode: effect.permissionMode,
+                previousPermissionMode: effect.previousPermissionMode,
                 modeVersion: effect.modeVersion,
                 changedAt: effect.changedAt,
                 changedBy: effect.changedBy,
@@ -822,6 +895,15 @@ export default function App() {
               })
               void reconcilePermissionModeState(effect.sessionId)
             }
+            break
+          }
+          case 'coding_mode_changed': {
+            // Another window or client changed it (this one already applied it optimistically)
+            setSessionOptions(prevOpts => {
+              const next = new Map(prevOpts)
+              next.set(effect.sessionId, mergeSessionOptions(next.get(effect.sessionId), { codingMode: effect.codingMode }))
+              return next
+            })
             break
           }
           case 'credential_request': {
@@ -911,13 +993,19 @@ export default function App() {
 
       const agentEvent = event as unknown as AgentEvent
 
+      // Background-task activity only updates a chip: it is not turn traffic (no watchdog reset, no
+      // session/message processing, which would re-render the session for every progress tick).
+      if (event.type === 'task_activity') {
+        handleBackgroundTaskEvent(store, sessionId, event, agentEvent)
+        return
+      }
+
       // Track activity for stale session watchdog
       trackSessionActivity(sessionId)
 
-      // Dispatch window event when compaction completes
-      // This allows FreeFormInput to sequence the plan execution message after compaction
-      // Note: markCompactionComplete is called on the backend (sessions.ts) to ensure
-      // it happens even if CMD+R occurs during compaction
+      // Dispatch a wakeup when compaction completes. FreeFormInput still checks
+      // persisted readiness and claims dispatch atomically; this event alone is
+      // not proof that Accept & Compact may execute the plan.
       if (event.type === 'info' && event.statusType === 'compaction_complete') {
         window.dispatchEvent(new CustomEvent('craft:compaction-complete', {
           detail: { sessionId }
@@ -970,6 +1058,21 @@ export default function App() {
             const rawPreview = lastMessage?.content?.substring(0, 200) || undefined
             const preview = rawPreview ? stripMarkdown(rawPreview).substring(0, 100) || undefined : undefined
             showSessionNotification(updatedSession, preview)
+
+            // In-app complement to the OS notification: when a *background*
+            // session (one not shown in any open panel) finishes, queue a chip
+            // above the chat. The OS notification above is suppressed while the
+            // window is focused, so the chip is the only completion signal then.
+            if (
+              store.get(showBackgroundFinishedChipAtom) &&
+              !store.get(visibleSessionIdsAtom).has(sessionId)
+            ) {
+              store.set(pushBackgroundFinishedAtom, {
+                sessionId,
+                title: getSessionTitle(updatedSession),
+                finishedAt: Date.now(),
+              })
+            }
           }
         }
 
@@ -1257,12 +1360,15 @@ export default function App() {
             }
             // Include storedPath and markdownPath for all attachment types
             // Agent will use Read tool to access text/office files via these paths
-            // If image was resized, use the resized base64 for Claude API
+            // If image was resized/normalized, use the stored base64 + mimeType for Claude API
             return {
               ...att,
               storedPath: stored.storedPath,
               markdownPath: stored.markdownPath,
-              // Use resized base64 if available (for images that exceeded size limits)
+              // Reflect any server-side normalization (e.g. HEIC/HEIF → JPEG) so the
+              // model receives a supported media type instead of silently dropping the image.
+              mimeType: stored.mimeType,
+              // Use resized/normalized base64 when the store produced one
               base64: stored.resizedBase64 ?? att.base64,
             }
           })
@@ -1381,7 +1487,22 @@ export default function App() {
       // Sync thinking level change with backend (session-level, persisted)
       window.electronAPI.sessionCommand(sessionId, { type: 'setThinkingLevel', level: updates.thinkingLevel })
     }
-  }, [sessionOptions])
+    if (updates.codingMode !== undefined) {
+      const enabled = updates.codingMode
+      // The server refuses once the conversation has started (the composer then offers a new
+      // session instead); roll the optimistic value back if it does
+      window.electronAPI.sessionCommand(sessionId, { type: 'setCodingMode', enabled }).catch((error: unknown) => {
+        setSessionOptions(prev => {
+          const next = new Map(prev)
+          next.set(sessionId, mergeSessionOptions(next.get(sessionId), { codingMode: !enabled }))
+          return next
+        })
+        toast.error(t('chat.codingMode.toggleFailed'), {
+          description: error instanceof Error ? error.message : String(error),
+        })
+      })
+    }
+  }, [sessionOptions, t])
 
   // Handle input draft changes per session with debounced persistence
   const draftSaveTimeoutRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
@@ -1640,6 +1761,8 @@ export default function App() {
     readFile: (path) => window.electronAPI.readFile(path),
     readFileDataUrl: (path) => window.electronAPI.readFileDataUrl(path),
     readFileBinary: (path) => window.electronAPI.readFileBinary(path),
+    // The Web UI can't open or reveal local files, so its file links keep the direct preview.
+    fileLinkMenu: !isWebUI,
   })
 
   const connectionState = useTransportConnectionState()
@@ -1976,7 +2099,7 @@ export default function App() {
       <FocusProvider>
         <DismissibleLayerProvider>
         <ModalProvider>
-        <TooltipProvider delayDuration={0}>
+        <TooltipProvider>
         <NavigationProvider
           workspaceId={windowWorkspaceId}
           workspaceSlug={windowWorkspaceSlug}
@@ -2043,6 +2166,15 @@ export default function App() {
               isDark={isDark}
             />
           )}
+
+          {/* File-link menu — opened by the link interceptor when a local file link is clicked */}
+          <FileLinkActionMenu
+            menu={linkInterceptor.fileLinkMenu}
+            onClose={linkInterceptor.closeFileLinkMenu}
+            onOpenExternal={linkInterceptor.openFileExternal}
+            onPreview={linkInterceptor.previewFile}
+            onReveal={linkInterceptor.showInFolder}
+          />
         </NavigationProvider>
         </TooltipProvider>
         </ModalProvider>

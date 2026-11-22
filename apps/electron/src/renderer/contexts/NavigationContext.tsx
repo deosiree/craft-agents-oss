@@ -40,6 +40,8 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { useAtomValue, useSetAtom, useStore } from 'jotai'
 import { useSession } from '@/hooks/useSession'
+import { useLabels } from '@/hooks/useLabels'
+import { matchesLabelFilter } from '@craft-agent/shared/labels'
 import {
   parseRoute,
   parseRouteToNavigationState,
@@ -68,11 +70,14 @@ import {
   isSettingsNavigation,
   isSkillsNavigation,
   isAutomationsNavigation,
+  isProjectsNavigation,
+  isPagesNavigation,
   DEFAULT_NAVIGATION_STATE,
 } from '../../shared/types'
 import { sessionMetaMapAtom, updateSessionMetaAtom, type SessionMeta } from '@/atoms/sessions'
 import { sourcesAtom } from '@/atoms/sources'
 import { skillsAtom } from '@/atoms/skills'
+import { guardedModeAvailableAtom } from '@/atoms/permission-modes'
 import {
   panelStackAtom,
   pushPanelAtom,
@@ -90,7 +95,7 @@ export type { Route }
 
 // Re-export navigation state types for consumers
 export type { NavigationState, SessionFilter }
-export { isSessionsNavigation, isSourcesNavigation, isSettingsNavigation, isSkillsNavigation, isAutomationsNavigation }
+export { isSessionsNavigation, isSourcesNavigation, isSettingsNavigation, isSkillsNavigation, isAutomationsNavigation, isProjectsNavigation, isPagesNavigation }
 
 // =============================================================================
 // Context
@@ -167,6 +172,8 @@ export function NavigationProvider({
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
   const sessionMetas = useMemo(() => Array.from(sessionMetaMap.values()), [sessionMetaMap])
   const updateSessionMeta = useSetAtom(updateSessionMetaAtom)
+  // Label tree for filter matching (auto-select must agree with the visible list).
+  const { labels: labelConfigs } = useLabels(workspaceId)
 
   const pushPanel = useSetAtom(pushPanelAtom)
 
@@ -548,9 +555,9 @@ export function NavigationProvider({
             return session.sessionStatus === filter.stateId && session.isArchived !== true
           case 'label': {
             if (session.isArchived === true) return false
-            if (!session.labels?.length) return false
-            if (filter.labelId === '__all__') return true
-            return session.labels.some(l => l === filter.labelId || l.startsWith(`${filter.labelId}::`))
+            // Shared predicate — descendant-aware and project-scoped, matching
+            // exactly what the session list renders (auto-select must agree).
+            return matchesLabelFilter(session, filter, labelConfigs)
           }
           case 'view':
             if (session.isArchived === true) return false
@@ -560,7 +567,7 @@ export function NavigationProvider({
         }
       })
     },
-    [sessionMetas, workspaceId]
+    [sessionMetas, workspaceId, labelConfigs]
   )
 
   const getFirstSessionId = useCallback(
@@ -629,8 +636,15 @@ export function NavigationProvider({
         }
       }
 
-      // Sessions: auto-select last/first session
-      if (isSessionsNavigation(nextState) && !nextState.details && !options?.skipAutoSelect) {
+      // Sessions: auto-select last/first session.
+      // Board view has no per-session detail, so skip auto-selection — otherwise
+      // navigating to the board would immediately resolve into a chat route.
+      if (
+        isSessionsNavigation(nextState) &&
+        nextState.viewMode !== 'board' &&
+        !nextState.details &&
+        !options?.skipAutoSelect
+      ) {
         const lastSelectedSessionId = getLastSelectedSessionId(nextState.filter)
         const fallbackSessionId = lastSelectedSessionId ?? getFirstSessionId(nextState.filter)
         if (fallbackSessionId) {
@@ -691,6 +705,15 @@ export function NavigationProvider({
           }
           if (parsed.params.systemPrompt) {
             createOptions.systemPromptPreset = parsed.params.systemPrompt as 'default' | 'mini' | string
+          }
+          if (parsed.params.status) {
+            createOptions.sessionStatus = parsed.params.status
+          }
+          if (parsed.params.label) {
+            createOptions.labels = [parsed.params.label]
+          }
+          if (parsed.params.project) {
+            createOptions.projectId = parsed.params.project
           }
           const session = await onCreateSession(workspaceId, createOptions)
 
@@ -810,6 +833,10 @@ export function NavigationProvider({
             const parsedMode = parsePermissionMode(parsed.params.mode)
             if (!parsedMode) {
               console.warn('[Navigation] Invalid permission mode:', parsed.params.mode)
+              break
+            }
+            if (parsedMode === 'guarded' && !store.get(guardedModeAvailableAtom)) {
+              console.warn('[Navigation] Guarded mode is not available (turn it on under Settings → AI → Decision model)')
               break
             }
             await window.electronAPI.sessionCommand(
@@ -963,19 +990,22 @@ export function NavigationProvider({
   // WORKSPACE SWITCH
   // =========================================================================
 
-  const previousWorkspaceSlugRef = useRef<string | null>(null)
+  const previousWorkspaceIdRef = useRef<string | null>(null)
 
   useEffect(() => {
     if (!workspaceId || !workspaceSlug || !isSessionsReady) return
 
-    if (previousWorkspaceSlugRef.current === null) {
+    if (previousWorkspaceIdRef.current === null) {
       // First mount — initial route restoration handles it
-      previousWorkspaceSlugRef.current = workspaceSlug
+      previousWorkspaceIdRef.current = workspaceId
       return
     }
 
-    if (previousWorkspaceSlugRef.current === workspaceSlug) return
-    previousWorkspaceSlugRef.current = workspaceSlug
+    // A switch is a new workspace ID. The slug alone can change without one: App falls back to the ID
+    // until the workspace list has loaded, and reading that as a switch replaced cold-load deep links
+    // (?route=…) with the workspace's stored URL.
+    if (previousWorkspaceIdRef.current === workspaceId) return
+    previousWorkspaceIdRef.current = workspaceId
 
     // Suppress pushState during reconciliation
     suppressPushRef.current = true
@@ -1221,19 +1251,28 @@ export function NavigationProvider({
     if (!isReady || !workspaceId) return
     // Don't auto-select when panel stack is empty (user closed all panels)
     if (store.get(panelStackAtom).length === 0) return
+    // Scoped to sessions with no explicit detail. resolveAutoSelection owns the
+    // selection decision (board skip, last/first fallback) so it lives in one
+    // place; this effect just applies it when the session list loads after
+    // navigation (workspace switch, lazy session load, etc.).
+    // Decide on the store's focused route, not this render's `navigationState`:
+    // an earlier effect in the same commit (initial restore from the URL,
+    // workspace switch) may already have replaced it, and the stale value
+    // auto-selected the first session over a cold-load ?route=…/session/<id>.
+    const liveRoute = store.get(focusedPanelRouteAtom)
+    const liveState = liveRoute ? parseRouteToNavigationState(liveRoute) : null
+    if (!liveState || !isSessionsNavigation(liveState) || liveState.details) return
     if (!isSessionsNavigation(navigationState) || navigationState.details) return
 
-    const lastSelectedSessionId = getLastSelectedSessionId(navigationState.filter)
-    const fallbackSessionId = lastSelectedSessionId ?? getFirstSessionId(navigationState.filter)
-    if (!fallbackSessionId) return
-
-    navigateToSession(fallbackSessionId)
+    const resolved = resolveAutoSelection(liveState)
+    if (isSessionsNavigation(resolved) && resolved.details) {
+      navigateToSession(resolved.details.sessionId)
+    }
   }, [
     isReady,
     workspaceId,
     navigationState,
-    getLastSelectedSessionId,
-    getFirstSessionId,
+    resolveAutoSelection,
     navigateToSession,
   ])
 
